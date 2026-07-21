@@ -6,9 +6,45 @@ The project combines simulation, spatial indexing, collision detection, AI-based
 
 ## Project status
 
-**Current phase:** architecture complete enough to begin Phase 1 implementation.
+**Current phase:** Phase 1 (local simulation kernel) is implemented, tested, and benchmarked. A local Matplotlib debug viewer has also been added (see below). Distributed workers, Redis, real-time streaming, and the production heatmap dashboard are later phases and are not part of this implementation.
 
-The first milestone is a single-process Python simulation kernel. Distributed workers, Redis, real-time streaming, and the heatmap interface are later phases and should not be included in the first implementation.
+## Getting started
+
+Run every command from the repository root (the folder containing `pyproject.toml`).
+
+**1. Install dependencies**
+
+```bash
+pip install -r requirements.txt
+# or, without the visualization dependency:
+pip install -e .
+```
+
+**2. Run the test suite**
+
+```bash
+python -m pytest -q
+```
+
+This picks up `src/` and `tests/` automatically via `pyproject.toml`'s `pythonpath`/`testpaths` settings — no manual `PYTHONPATH` needed.
+
+**3. Run the benchmark**
+
+```bash
+python benchmarks/benchmark_simulation.py
+# or customize:
+python benchmarks/benchmark_simulation.py --ticks 20 --sizes 1000 10000
+```
+
+Runs the kernel headlessly at 1,000 / 10,000 / 100,000 drones and reports tick latency, throughput, candidate pairs, collisions, and near misses.
+
+**4. Run the local debug viewer**
+
+```bash
+python scripts/run_visualizer.py --drones 10000 --render-every 5
+```
+
+See [Local debug viewer](#local-debug-viewer-prototype) below for details and keyboard controls.
 
 ## Goals
 
@@ -140,11 +176,12 @@ Phase 1 is complete when the local kernel can:
 
 Reaching 100,000 drones is a benchmark target, not permission to sacrifice correctness. Performance optimization begins only after the spatial detector matches the reference detector.
 
-## Planned project structure
+## Project structure
 
 ```text
 drone-collision-simulator/
 ├── README.md
+├── requirements.txt
 ├── pyproject.toml
 ├── src/
 │   └── drone_sim/
@@ -155,17 +192,19 @@ drone-collision-simulator/
 │       ├── boundaries.py
 │       ├── spatial_hash.py
 │       ├── collisions.py
-│       └── metrics.py
+│       ├── metrics.py
+│       └── visualization.py
 ├── tests/
 │   ├── test_movement.py
 │   ├── test_boundaries.py
 │   ├── test_spatial_hash.py
-│   └── test_collisions.py
-└── benchmarks/
-    └── benchmark_simulation.py
+│   ├── test_collisions.py
+│   └── test_visualization.py
+├── benchmarks/
+│   └── benchmark_simulation.py
+└── scripts/
+    └── run_visualizer.py
 ```
-
-This structure is provisional. It should remain small until the local simulation kernel is working and benchmarked.
 
 ## Roadmap
 
