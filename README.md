@@ -231,6 +231,49 @@ This structure is provisional. It should remain small until the local simulation
 | Frontend, later | React with Canvas or WebGL rendering |
 | Messaging, later | Redis only if distributed measurements justify it |
 
+## Local debug viewer (prototype)
+
+A minimal Matplotlib-based viewer lets you watch the Phase 1 kernel run from a
+top-down (x/y) perspective while you develop or debug it. It is a **prototype
+for local debugging only** — not the Phase 3 production dashboard, and it adds
+no React, FastAPI, REST, WebSocket/SSE, Redis, or GPU code. It reuses the
+existing `Simulation`, `DroneState`, and `DetectionResult` APIs unchanged; the
+headless benchmark remains fully independent of it.
+
+It renders a density heatmap of drone positions (via `numpy.histogram2d`,
+vectorized, no per-drone Python loop) plus red markers at the midpoint of each
+collision detected in the most recently rendered interval.
+
+Install the extra dependency (already listed in `requirements.txt` and the
+`viz` optional dependency group in `pyproject.toml`):
+
+```bash
+pip install matplotlib
+# or
+pip install -r requirements.txt
+```
+
+Launch it from the repo root:
+
+```bash
+python scripts/run_visualizer.py --drones 10000 --render-every 5
+```
+
+Useful flags: `--drones`, `--seed`, `--render-every` (simulation ticks per
+redraw), `--bins` (density grid resolution per axis).
+
+Keyboard controls (shown at the bottom of the window):
+
+| Key | Action |
+| --- | --- |
+| Space | Pause / resume |
+| R | Reset the simulation (same config and seed) |
+| Escape / close window | Quit |
+
+The metrics panel distinguishes current-interval values (since the last
+redraw) from cumulative values (since the simulation started or was last
+reset).
+
 ## License
 
 No license has been selected yet.
