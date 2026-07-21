@@ -1,0 +1,5 @@
+# Ignore GitHub Actions and configurations
+.github/
+
+# Ignore Graphify output directory
+graphify-out/
