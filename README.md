@@ -6,7 +6,7 @@ The project combines simulation, spatial indexing, collision detection, AI-based
 
 ## Project status
 
-**Current phase:** Phase 1 (local simulation kernel) is implemented, tested, and benchmarked. A local Matplotlib debug viewer has also been added (see below). Distributed workers, Redis, real-time streaming, and the production heatmap dashboard are later phases and are not part of this implementation.
+**Current phase:** Phase 1 (local simulation kernel) and Phase 2 (AI and scenario control — batched movement policies, trajectory prediction, local collision avoidance, controlled rare-collision scenarios, collision-rate validation) are implemented, tested, and benchmarked. A local Matplotlib debug viewer has also been added (see below). Online reinforcement learning, `NeuralAvoidanceMovementAlgorithm`, distributed workers, Redis, real-time streaming, and the production heatmap dashboard are later phases and are not part of this implementation.
 
 ## Getting started
 
@@ -26,7 +26,7 @@ pip install -e .
 python -m pytest -q
 ```
 
-This picks up `src/` and `tests/` automatically via `pyproject.toml`'s `pythonpath`/`testpaths` settings — no manual `PYTHONPATH` needed.
+This picks up `src/` and `tests/` automatically via `pyproject.toml`'s `pythonpath`/`testpaths` settings — no manual `PYTHONPATH` needed. 128 tests as of Phase 2 (kernel, movement/trajectory/scenario/validation — including the collision-pair-tick and unique-collision-event metrics — and visualization-calculation tests).
 
 **3. Run the benchmark**
 
@@ -140,15 +140,27 @@ The optimized detector will be verified against a brute-force reference implemen
 
 ## Movement and AI
 
-Movement algorithms are interchangeable policies applied in batches. Planned policies include:
+Movement algorithms are interchangeable policies applied in batches:
 
-- Random movement for baseline simulation
-- Scripted routes for deterministic scenarios
-- AI movement for local avoidance and trajectory selection
+- `RandomMovementAlgorithm` — reproducible random walk (Phase 1 baseline).
+- `ScriptedMovementAlgorithm` — constant velocity (Phase 1, deterministic).
+- `GoalDirectedMovementAlgorithm` — steers toward a fixed destination with
+  acceleration/speed limits and no avoidance (Phase 2). Serves as the
+  no-avoidance comparison baseline for local avoidance.
+- `LocalAvoidanceMovementAlgorithm` — goal-directed movement plus a bounded
+  correction away from the single most urgent predicted threat (Phase 2).
+- `NeuralAvoidanceMovementAlgorithm` — **planned, not implemented.** See
+  [Phase 2: AI and scenario control](#phase-2-ai-and-scenario-control) below
+  for why it comes after deterministic avoidance is proven correct.
 
-The AI movement layer should use local numerical inference or decision algorithms rather than one external model request per drone. Movement policies must operate on batches of drone state to remain practical at 100,000 drones.
+All policies operate on batches of drone state (never a per-drone Python
+loop) to remain practical at 100,000 drones.
 
-Rare collisions will be produced by a scenario controller that occasionally creates converging routes or alters avoidance behavior for selected drones. It influences movement generation; it does not change collision-detection rules.
+Rare collisions are produced by a deterministic, seeded scenario factory
+(`src/drone_sim/scenarios.py`) that injects a small, known number of
+collision courses and near misses among many safe background drones. It only
+influences movement generation and starting conditions; it never changes
+collision-detection rules.
 
 ## Collision processing
 
@@ -189,6 +201,9 @@ drone-collision-simulator/
 │       ├── state.py
 │       ├── simulation.py
 │       ├── movement.py
+│       ├── trajectory.py
+│       ├── scenarios.py
+│       ├── validation.py
 │       ├── boundaries.py
 │       ├── spatial_hash.py
 │       ├── collisions.py
@@ -196,6 +211,9 @@ drone-collision-simulator/
 │       └── visualization.py
 ├── tests/
 │   ├── test_movement.py
+│   ├── test_trajectory.py
+│   ├── test_scenarios.py
+│   ├── test_validation.py
 │   ├── test_boundaries.py
 │   ├── test_spatial_hash.py
 │   ├── test_collisions.py
@@ -217,13 +235,15 @@ drone-collision-simulator/
 - Collision and near-miss detection
 - Correctness tests and benchmarks
 
-### Phase 2: AI and scenario control
+### Phase 2: AI and scenario control (complete)
 
-- Batched movement policies
+- Batched movement policies (`GoalDirectedMovementAlgorithm`, `LocalAvoidanceMovementAlgorithm`)
+- Trajectory prediction (`TrajectoryPredictionService`)
 - Local collision avoidance
-- Trajectory prediction
-- Controlled rare-collision scenarios
-- Collision-rate validation
+- Controlled rare-collision scenarios (`src/drone_sim/scenarios.py`)
+- Collision-rate validation (`src/drone_sim/validation.py`)
+- Online reinforcement learning and `NeuralAvoidanceMovementAlgorithm` are
+  explicitly deferred — see [Phase 2](#phase-2-ai-and-scenario-control) below.
 
 ### Phase 3: Visualization and APIs
 
@@ -269,6 +289,213 @@ drone-collision-simulator/
 | Streaming, later | WebSocket or SSE |
 | Frontend, later | React with Canvas or WebGL rendering |
 | Messaging, later | Redis only if distributed measurements justify it |
+
+## Phase 2: AI and scenario control
+
+Phase 2 adds goal-seeking and local collision avoidance on top of the
+unchanged Phase 1 kernel, plus the deterministic scenarios and validation
+harness needed to prove avoidance actually helps before any neural policy is
+considered.
+
+### Corrected architecture (authoritative)
+
+```
+World "1" *-- "1" DroneState                          : owns
+MovementSystem "1" --> "1" DroneState                  : reads and batch-updates
+MovementSystem "1" o-- "1..*" MovementAlgorithm        : registers and dispatches
+MovementAlgorithm <|-- RandomMovementAlgorithm
+MovementAlgorithm <|-- ScriptedMovementAlgorithm
+MovementAlgorithm <|-- GoalDirectedMovementAlgorithm
+MovementAlgorithm <|-- LocalAvoidanceMovementAlgorithm
+MovementAlgorithm <|.. NeuralAvoidanceMovementAlgorithm  : planned, not implemented
+```
+
+- `DroneState` never invokes or references a `MovementAlgorithm` — it is
+  passive NumPy state (`positions`, `velocities`, `active_mask`,
+  `movement_policy_ids`, and now an optional `goal_positions`). Policy
+  *objects* live only in `MovementSystem.policies`; `DroneState` only ever
+  holds the integer `movement_policy_ids`.
+- `MovementSystem` reads those ids, groups active drones into one batch per
+  distinct id, and dispatches each batch to its policy once. An unknown
+  policy id present on an active drone raises immediately instead of being
+  silently skipped.
+- `SpatialHashGrid`, `BoundaryManager`, and `CollisionDetectionEngine` are
+  unchanged from Phase 1 and contain no movement, avoidance, or neural logic.
+- Destinations (`goal_positions`) are assigned during **scenario generation**
+  (`src/drone_sim/scenarios.py`), never inside `MovementSystem.step()`.
+
+### Phase 2 tick flow
+
+Ticks are only more expensive than Phase 1 when at least one *registered*
+policy sets `MovementAlgorithm.requires_context = True` (currently only
+`LocalAvoidanceMovementAlgorithm`). `SimulationEngine` checks this once at
+construction time; if no such policy is registered, the tick is byte-for-byte
+the Phase 1 flow — no extra grid build, no prediction, no context.
+
+```
+ 1. Read current active DroneState.
+ 2. Build SpatialHashGrid from PRE-MOVEMENT positions.
+ 3. Generate unique candidate pairs.
+ 4. TrajectoryPredictionService predicts time-to-closest-approach and
+    predicted separation for each pair.
+ 5. NeighborFeatureBuilder builds a MovementContext (one row per drone: its
+    single most urgent candidate pair, plus goal_vectors).
+ 6. MovementSystem groups drones by movement_policy_ids.
+ 7. Each policy is dispatched once for its complete batch (context passed
+    through; Random/Scripted ignore it).
+ 8. Positions are integrated for all active drones.
+ 9. BoundaryManager applies world constraints.
+10. SpatialHashGrid is REBUILT from POST-MOVEMENT positions.
+11. CollisionDetectionEngine detects actual collisions/near misses from that
+    rebuilt grid — the pre-movement grid/pairs from step 2 are never reused
+    here.
+12. CollisionResolutionEngine resolves; MetricsCollector records.
+```
+
+The pre-movement prediction only ever estimates *risk*; it is never the
+authority for whether a collision actually happened. That distinction is
+deliberate and load-bearing: `TrajectoryPredictionService` and
+`CollisionDetectionEngine` never call each other.
+
+### Trajectory-prediction mathematics
+
+For each candidate pair `(i, j)`, assuming both keep their current velocity:
+
+```
+relative_position = position_j - position_i
+relative_velocity = velocity_j - velocity_i
+
+time_to_closest_approach = clip(
+    -dot(relative_position, relative_velocity)
+    / dot(relative_velocity, relative_velocity),
+    0, prediction_horizon,
+)   # guarded to 0 when relative speed is ~0, never divides by zero
+
+predicted_separation = norm(
+    relative_position + relative_velocity * time_to_closest_approach
+)
+```
+
+Each pair is then classified, in priority order:
+
+1. `PREDICTED_COLLISION` — `predicted_separation <= collision_radius`
+2. `PREDICTED_NEAR_MISS` — `collision_radius < predicted_separation <= near_miss_radius`
+3. `NOT_CLOSING_OR_OUTSIDE_HORIZON` — pair is diverging, or the true
+   (unclipped) closest-approach time is beyond `prediction_horizon`
+4. `CURRENTLY_SAFE` — everything else
+
+Distance thresholds are checked before the not-closing/horizon flag, so a
+pair already inside a risk band is never miscategorized just because it
+happens to be (barely) diverging at this instant.
+
+`LocalAvoidanceMovementAlgorithm` turns this into an urgency score gated on
+distance (`dist_urgency`, provably `0` whenever the pair isn't
+`PREDICTED_COLLISION`/`PREDICTED_NEAR_MISS`) and modulated — never
+independently triggered — by time-to-closest-approach, so a pair correctly
+classified as safe or diverging can never generate a correction purely
+because its (irrelevant, clamped) time-to-closest-approach looks small.
+
+### Controlled scenarios (`src/drone_sim/scenarios.py`)
+
+Seven deterministic, seeded scenario factories, each returning a
+`ScenarioResult` (a real `World` plus precomputed ground truth):
+
+| Scenario | Purpose |
+| --- | --- |
+| `head_on_collision` | Two drones on a guaranteed head-on collision course |
+| `crossing_paths` | Perpendicular paths meeting at the same point and tick |
+| `near_miss` | Closest approach lands just outside `collision_radius`, inside the near-miss band |
+| `parallel_safe` | Constant-separation control — must never register a collision or near miss |
+| `stationary_obstacle` | One stationary drone; another flies directly into it |
+| `converging_group` | Several drones converging on the world center from a ring |
+| `rare_collision_background` | Many safe background drones + a small, known number of injected collision courses and near misses, with reflective goals so it can also drive policy comparison |
+
+Timed scenarios use `dt`-aware geometry (a fixed tick count to closest
+approach, scaled by `config.dt`) so the precomputed ground truth always lands
+exactly on a simulated tick regardless of the configured time step.
+
+### Collision-event deduplication and the two collision measurements
+
+The simulator reports two distinct, complementary collision measurements,
+both computed by `CollisionEventAccumulator` in `validation.py` from the
+canonical (`i = min(a, b)`, `j = max(a, b)`) set of currently-colliding pairs
+each tick:
+
+- **Collision-pair tick** — one unordered drone pair observed inside
+  `collision_radius` during one simulation tick. Every tick a pair is
+  colliding, it adds 1 to `collision_pair_ticks`, whether or not that's the
+  first tick of the contact. This measures **total time spent colliding**,
+  including persistent collisions:
+  `collision_pair_ticks += number_of_current_collision_pairs` each tick.
+- **Unique collision event** — begins the tick an unordered pair transitions
+  from not-colliding to colliding (`current_pairs - previous_tick_pairs`). A
+  continuously overlapping pair is **not** re-counted as a new event every
+  tick it persists; if it separates for at least one tick and later collides
+  again, that is a second event. A collision already present on the first
+  measured tick counts as one event. Near misses never enter either
+  collision metric — they are tracked in a separate accumulator instance.
+
+Derived from the two:
+
+```
+average_collision_pairs_per_tick = collision_pair_ticks / measured_tick_count
+average_collision_duration_ticks = collision_pair_ticks / unique_collision_events
+```
+
+`average_collision_duration_ticks` is the average number of collision-pair-tick
+readings belonging to each separate collision event (how long, on average, a
+collision lasted). It is `0.0` — never `NaN` or an error — when
+`unique_collision_events` is zero.
+
+Worked example (used verbatim as a unit test): a pair colliding on ticks
+2, 3, 4 and 6 of a 6-tick run (safe on ticks 1 and 5) gives
+`collision_pair_ticks = 4`, `unique_collision_events = 2`,
+`average_collision_pairs_per_tick = 4/6`, `average_collision_duration_ticks = 2.0`.
+
+`CollisionEventAccumulator.previous_pairs` starts empty on every new instance
+— state never leaks between policy runs or seeds; `CollisionRateValidator.run_policy`
+creates a fresh accumulator (one for collisions, one for near misses) on
+every call.
+
+### Validation metrics (`src/drone_sim/validation.py`)
+
+`CollisionRateValidator.compare(...)` runs the same scenario world (deep-
+copied per policy, so runs never share mutable state) under
+`ScriptedMovementAlgorithm` / `GoalDirectedMovementAlgorithm` /
+`LocalAvoidanceMovementAlgorithm` and reports, per policy: unique collision
+events, collision-pair ticks, average collision pairs per tick, average
+collision duration (ticks), collisions per 10,000 drone-seconds, unique
+near-miss events, near misses per 10,000 drone-seconds, avoidance success
+rate (fraction of the scenario's known injected collision-course pairs that
+never actually collided), minimum observed separation, destination
+completion rate, average travel time, average drone speed, and
+stationary-drone percentage. `compare_seed_suite(...)` repeats this across a
+deterministic seed list and aggregates (means) per policy — no individual
+seeded run is required to improve, only the aggregate.
+
+Interpreting the two collision metrics together:
+- Both decrease → avoidance reduces collision incidence **and** total
+  collision exposure.
+- Unique events decrease but collision-pair ticks do not → avoidance
+  prevents some collisions, but the remaining ones persist longer.
+- Neither decreases → the policy has not demonstrated collision reduction.
+
+**The fair "does avoidance help" comparison is `goal_directed_no_avoidance`
+vs. `local_avoidance`** — both actively seek the same goals, so both produce
+the same busy, converging background traffic pattern; `scripted_baseline`
+never seeks goals at all, so it naturally sees far less incidental traffic
+and is not an apples-to-apples comparison for the *aggregate* rate (it
+remains the correct ground-truth check for the specific injected pairs).
+
+### Why neural training comes after deterministic validation
+
+`NeuralAvoidanceMovementAlgorithm` is **planned future work, not
+implemented**. Training or evaluating a learned avoidance policy requires a
+trustworthy way to measure whether it actually reduces collision risk without
+just stopping drones or abandoning their goals — that measurement tool
+(`CollisionRateValidator`, exercised against known deterministic scenarios)
+is exactly what this phase built. Deterministic avoidance and its validation
+harness are the prerequisite, not a placeholder to route around.
 
 ## Local debug viewer (prototype)
 

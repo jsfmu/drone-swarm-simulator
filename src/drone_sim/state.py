@@ -25,6 +25,11 @@ class DroneState:
     velocities: np.ndarray           # (N, 3) float32
     active_mask: np.ndarray          # (N,)   bool
     movement_policy_ids: np.ndarray  # (N,)   int32
+    # Optional (N, 3) float32 destinations for goal-directed / avoidance
+    # policies. ``None`` for Phase 1 scenarios that never assign goals.
+    # Destination initialization belongs in scenario generation, never inside
+    # MovementSystem.step().
+    goal_positions: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         n = self.positions.shape[0]
@@ -32,6 +37,8 @@ class DroneState:
         assert self.velocities.shape == (n, 3)
         assert self.active_mask.shape == (n,)
         assert self.movement_policy_ids.shape == (n,)
+        if self.goal_positions is not None:
+            assert self.goal_positions.shape == (n, 3)
 
     @property
     def num_drones(self) -> int:
