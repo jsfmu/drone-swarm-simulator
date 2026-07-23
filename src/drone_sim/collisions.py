@@ -126,9 +126,18 @@ class CollisionDetectionEngine:
     def __init__(self, config: SimulationConfig) -> None:
         self.config = config
 
-    def detect(self, state: DroneState, grid: SpatialHashGrid) -> DetectionResult:
-        """Spatial-hash detection. ``grid`` must already be built for this tick."""
-        pairs = grid.candidate_pairs()
+    def detect(
+        self, state: DroneState, grid: SpatialHashGrid, pairs: np.ndarray | None = None
+    ) -> DetectionResult:
+        """Spatial-hash detection. ``grid`` must already be built for this tick.
+
+        ``pairs`` lets a caller that already computed ``grid.candidate_pairs()``
+        (e.g. stage-by-stage profiling in :class:`~drone_sim.simulation.SimulationEngine`)
+        pass them in directly instead of having this method recompute them.
+        Omitting it — every existing call site — behaves exactly as before.
+        """
+        if pairs is None:
+            pairs = grid.candidate_pairs()
         return _classify(
             pairs,
             state.positions,

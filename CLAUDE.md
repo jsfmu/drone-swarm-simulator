@@ -15,9 +15,15 @@ controlled collision scenarios added later. Development order is strict:
 The local single-process kernel (Phase 1) is complete and unchanged. Phase 2
 (batched goal-directed movement, trajectory prediction, local collision
 avoidance, controlled rare-collision scenarios, collision-rate validation) is
-now also complete. 128 tests pass. Benchmarks run at 1k / 10k / 100k drones,
-headless and unchanged (Phase 2 adds zero overhead to that path — see
-"Invariants" below).
+now also complete. 142 tests pass. `benchmark_simulation.py` (Phase 1 path,
+1k/10k/100k, headless) remains unchanged (Phase 2 adds zero overhead to that
+path — see "Invariants" below). A **separate** `benchmark_avoidance.py` now
+measures the full Phase 2 avoidance tick path at 1k/10k/100k — both complete
+successfully at 100,000 drones (goal_directed 232 ms/tick, local_avoidance
+404 ms/tick, ~1.7-2.0x slowdown). Do not read `benchmark_simulation.py`'s
+~7.3 ticks/second as covering avoidance — see README.md's "Phase 2 avoidance
+benchmark" for the real numbers and the dominant bottleneck (candidate-pair
+generation, computed twice per tick, ~69% of total tick time at every scale).
 
 On top of the unchanged kernel, a minimal Matplotlib-based **local debug
 viewer** has also been added (`src/drone_sim/visualization.py`, launched via
@@ -31,8 +37,9 @@ explicitly asked.
 Run everything from the repo root (the folder containing `pyproject.toml`):
 
 ```bash
-python -m pytest -q                         # full suite (128 tests)
-python benchmarks/benchmark_simulation.py   # 1k / 10k / 100k benchmark, headless
+python -m pytest -q                         # full suite (142 tests)
+python benchmarks/benchmark_simulation.py   # Phase 1 path only: 1k/10k/100k, headless
+python benchmarks/benchmark_avoidance.py    # Phase 2 avoidance path: 1k/10k/100k, headless
 python scripts/run_visualizer.py --drones 10000 --render-every 5   # local debug viewer
 ```
 
@@ -49,9 +56,11 @@ src/drone_sim/   config, state, movement, trajectory, scenarios, validation,
                  boundaries, spatial_hash, collisions, metrics, simulation,
                  visualization
 tests/           test_movement, test_trajectory, test_scenarios,
-                 test_validation, test_boundaries, test_spatial_hash,
-                 test_collisions, test_visualization
-benchmarks/      benchmark_simulation.py
+                 test_validation, test_simulation, test_benchmark_avoidance,
+                 test_boundaries, test_spatial_hash, test_collisions,
+                 test_visualization
+benchmarks/      benchmark_simulation.py (Phase 1 path), benchmark_avoidance.py
+                 (Phase 2 avoidance path)
 scripts/         run_visualizer.py (launches the local debug viewer)
 ```
 
@@ -93,6 +102,20 @@ walkthrough and the trajectory-prediction math.
 - The headless benchmark (`benchmarks/benchmark_simulation.py`) stays fully
   independent of the visualization module — it must run with no display and
   without importing `visualization.py`.
+- **`SimulationEngine.step`'s optional `profile: TickProfile | None` param is
+  the only stage-timing instrumentation.** Disabled by default (`None`,
+  every pre-existing call site) — zero behavior change, negligible overhead.
+  When passed a `TickProfile()`, `step()` fills in nanosecond stage timings
+  for all 10 pipeline stages and marks `context_stages_skipped=True` when no
+  `requires_context` policy is registered (never silently omits those
+  stages). The only behavioral difference profiling introduces: it calls
+  `grid.candidate_pairs()` once explicitly and passes it to
+  `CollisionDetectionEngine.detect(state, grid, pairs=...)` (a new optional
+  kwarg, `None` by default and behavior-preserving) so `post_pairs_ns` and
+  `detection_ns` can be measured separately — pure overhead confined to the
+  profiled run, never changes a detection result. `benchmarks/benchmark_avoidance.py`
+  is the only consumer; `simulation.py` has no import of or dependency on
+  the benchmark.
 - **`DroneState` never invokes or references a `MovementAlgorithm`** — only
   integer `movement_policy_ids`. Policy objects live solely in
   `MovementSystem.policies`. Destinations (`goal_positions`) are assigned

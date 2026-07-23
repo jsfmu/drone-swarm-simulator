@@ -6,7 +6,10 @@ The project combines simulation, spatial indexing, collision detection, AI-based
 
 ## Project status
 
-**Current phase:** Phase 1 (local simulation kernel) and Phase 2 (AI and scenario control — batched movement policies, trajectory prediction, local collision avoidance, controlled rare-collision scenarios, collision-rate validation) are implemented, tested, and benchmarked. A local Matplotlib debug viewer has also been added (see below). Online reinforcement learning, `NeuralAvoidanceMovementAlgorithm`, distributed workers, Redis, real-time streaming, and the production heatmap dashboard are later phases and are not part of this implementation.
+**Current phase:** Phase 1 (local simulation kernel) and Phase 2 (AI and scenario control — batched movement policies, trajectory prediction, local collision avoidance, controlled rare-collision scenarios, collision-rate validation) are implemented and tested. Both are now also benchmarked, but **as two separate benchmarks measuring two different tick paths** — see below; do not read one benchmark's throughput as covering the other. A local Matplotlib debug viewer has also been added (see below). Online reinforcement learning, `NeuralAvoidanceMovementAlgorithm`, distributed workers, Redis, real-time streaming, and the production heatmap dashboard are later phases and are not part of this implementation.
+
+- `benchmarks/benchmark_simulation.py` measures the **Phase 1 tick path** (Random/Scripted policies, no `requires_context` policy registered — no pre-movement grid, prediction, or context construction). Its 100,000-drone, ~7.3 ticks/second result reflects *only* this path.
+- `benchmarks/benchmark_avoidance.py` measures the **full Phase 2 avoidance tick path** (`GoalDirectedMovementAlgorithm` vs. `LocalAvoidanceMovementAlgorithm`, including the pre-movement spatial hash, trajectory prediction, `MovementContext` construction, and the extra post-movement grid rebuild). It completes successfully at 100,000 drones for both policies — see [Phase 2 avoidance benchmark](#phase-2-avoidance-benchmark) below for measured throughput, the per-stage timing breakdown, and the dominant bottleneck.
 
 ## Getting started
 
@@ -26,9 +29,9 @@ pip install -e .
 python -m pytest -q
 ```
 
-This picks up `src/` and `tests/` automatically via `pyproject.toml`'s `pythonpath`/`testpaths` settings — no manual `PYTHONPATH` needed. 128 tests as of Phase 2 (kernel, movement/trajectory/scenario/validation — including the collision-pair-tick and unique-collision-event metrics — and visualization-calculation tests).
+This picks up `src/` and `tests/` automatically via `pyproject.toml`'s `pythonpath`/`testpaths` settings — no manual `PYTHONPATH` needed. 142 tests as of the Phase 2 avoidance benchmark (kernel, movement/trajectory/scenario/validation, the `TickProfile` profiling interface, the avoidance benchmark's setup helpers, and visualization-calculation tests).
 
-**3. Run the benchmark**
+**3. Run the benchmarks**
 
 ```bash
 python benchmarks/benchmark_simulation.py
@@ -36,7 +39,15 @@ python benchmarks/benchmark_simulation.py
 python benchmarks/benchmark_simulation.py --ticks 20 --sizes 1000 10000
 ```
 
-Runs the kernel headlessly at 1,000 / 10,000 / 100,000 drones and reports tick latency, throughput, candidate pairs, collisions, and near misses.
+Runs the **Phase 1** kernel headlessly at 1,000 / 10,000 / 100,000 drones (Random/Scripted policies) and reports tick latency, throughput, candidate pairs, collisions, and near misses.
+
+```bash
+python benchmarks/benchmark_avoidance.py
+# or customize:
+python benchmarks/benchmark_avoidance.py --sizes 1000 10000 --ticks 20 --seeds 1 2 3
+```
+
+Runs the **full Phase 2 avoidance tick path** headlessly at 1,000 / 10,000 / 100,000 drones, comparing `GoalDirectedMovementAlgorithm` (no avoidance) against `LocalAvoidanceMovementAlgorithm` under identical starting positions, velocities, goals, and seeds. Reports the same kind of tick-latency/throughput table, plus a 10-stage timing breakdown (pre/post-movement spatial hash, trajectory prediction, context construction, movement, boundaries, detection, resolution) and an approximate tracked-array memory footprint. See [Phase 2 avoidance benchmark](#phase-2-avoidance-benchmark) below for results and the dominant bottleneck.
 
 **4. Run the local debug viewer**
 
@@ -496,6 +507,73 @@ just stopping drones or abandoning their goals — that measurement tool
 (`CollisionRateValidator`, exercised against known deterministic scenarios)
 is exactly what this phase built. Deterministic avoidance and its validation
 harness are the prerequisite, not a placeholder to route around.
+
+### Phase 2 avoidance benchmark
+
+`benchmarks/benchmark_simulation.py`'s Phase 1 configs never register a
+`requires_context` policy, so they never execute the pre-movement spatial
+hash, trajectory prediction, `MovementContext` construction, or the extra
+post-movement grid rebuild that `LocalAvoidanceMovementAlgorithm` triggers.
+`benchmarks/benchmark_avoidance.py` measures that complete path directly,
+comparing `GoalDirectedMovementAlgorithm` (no avoidance) against
+`LocalAvoidanceMovementAlgorithm` under identical starting positions,
+velocities, active masks, goal positions, configuration, and seeds (one
+reproducible `World` per size/seed, deep-copied per policy; warm-up runs on a
+separate, discarded copy).
+
+**Both policies complete successfully at 100,000 drones** (default run: 3
+seeds × 10 measured ticks, after 2 warm-up ticks):
+
+| policy | drones | mean ms/tick | ticks/s | slowdown vs. goal-directed |
+| --- | --- | --- | --- | --- |
+| goal_directed | 1,000 | 5.15 ± 0.08 | 194.3 | — |
+| local_avoidance | 1,000 | 10.09 ± 0.35 | 99.2 | 1.96x |
+| goal_directed | 10,000 | 24.22 ± 0.84 | 41.4 | — |
+| local_avoidance | 10,000 | 44.34 ± 1.87 | 22.6 | 1.83x |
+| goal_directed | 100,000 | 232.48 ± 3.94 | 4.30 | — |
+| local_avoidance | 100,000 | 403.53 ± 13.73 | 2.48 | 1.74x |
+
+**Dominant bottleneck: candidate-pair generation, computed twice per tick —
+not the new trajectory-prediction/context code.** Per-stage timing (mean
+ms/tick, one representative seed) at 100,000 drones for `local_avoidance`:
+
+| stage | ms | % of total |
+| --- | --- | --- |
+| pre-movement candidate pairs | 128.9 | 34.0% |
+| post-movement candidate pairs | 132.0 | 34.8% |
+| movement (dispatch + integration) | 42.2 | 11.1% |
+| pre-movement grid build | 14.1 | 3.7% |
+| context construction | 15.4 | 4.1% |
+| post-movement grid build | 13.9 | 3.7% |
+| resolution | 23.4 | 6.2% |
+| boundary | 2.1 | 0.6% |
+| trajectory prediction | 4.8 | 1.3% |
+| detection (classification only) | 2.1 | 0.6% |
+| **total** | **378.9** | — |
+
+`SpatialHashGrid.candidate_pairs()` alone is **~69% of total tick time**, and
+this holds at every scale tested (~75% at 1,000 drones, ~69% at 10,000,
+~69% at 100,000) — it is *also* the dominant cost of the Phase 1 baseline
+itself (67% of `goal_directed`'s own 206.1 ms/tick at 100,000 drones); Phase 2
+avoidance's main added cost is paying that already-expensive operation a
+**second time** per tick (once pre-movement for risk assessment, once
+post-movement for actual detection), not the new prediction/context code,
+which together cost under 20 ms of the ~172 ms difference between the two
+policies at 100,000 drones. Stage timings sum to within 0.03 ms of measured
+total tick time at every scale (attributable to negligible Python-level
+bookkeeping between `time.perf_counter_ns()` calls) — profiling is opt-in and
+adds one extra (otherwise redundant) `candidate_pairs()` call versus the
+un-profiled comparison run above, so the two runs' total times are not
+expected to match exactly.
+
+Approximate tracked NumPy-array memory at 100,000 drones: `DroneState` 4.10
+MB, candidate pairs 0.33 MB, `MovementContext` 5.70 MB, `PredictionResult`
+0.69 MB — 10.82 MB total, negligible next to the ~120 MB whole-process peak
+working set measured for the entire benchmark run (a Windows-specific
+`ctypes`/`psapi` reading — no new dependency added; falls back to "not
+available" on platforms where no stdlib-only method exists).
+
+Run it yourself: `python benchmarks/benchmark_avoidance.py`.
 
 ## Local debug viewer (prototype)
 
