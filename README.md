@@ -248,13 +248,19 @@ drone-collision-simulator/
 
 ### Phase 2: AI and scenario control (complete)
 
-- Batched movement policies (`GoalDirectedMovementAlgorithm`, `LocalAvoidanceMovementAlgorithm`)
-- Trajectory prediction (`TrajectoryPredictionService`)
-- Local collision avoidance
-- Controlled rare-collision scenarios (`src/drone_sim/scenarios.py`)
-- Collision-rate validation (`src/drone_sim/validation.py`)
-- Online reinforcement learning and `NeuralAvoidanceMovementAlgorithm` are
-  explicitly deferred — see [Phase 2](#phase-2-ai-and-scenario-control) below.
+- ~~Batched movement policies (`GoalDirectedMovementAlgorithm`, `LocalAvoidanceMovementAlgorithm`)~~
+- ~~Trajectory prediction (`TrajectoryPredictionService`)~~
+- ~~Local collision avoidance~~
+- ~~Controlled rare-collision scenarios (`src/drone_sim/scenarios.py`)~~
+- ~~Collision-rate validation (`src/drone_sim/validation.py`)~~
+- ~~Online reinforcement learning and ~~`NeuralAvoidanceMovementAlgorithm` are
+  explicitly deferred — see [Phase 2]~~(#phase-2-ai-and-scenario-control) below.~~
+
+  Neural avoidance decision
+
+A neural-network avoidance policy was prototyped and evaluated but was removed from the project. It increased tick-processing cost without providing enough practical improvement over the deterministic local-avoidance policy.
+
+The deterministic policy remains the production movement strategy because it is faster, explainable, reproducible, and directly validated against controlled collision scenarios. Neural avoidance is not currently planned.
 
 ### Phase 3: Visualization and APIs
 
