@@ -13,18 +13,27 @@ orchestration).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import Response
+import numpy as np
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import Response, StreamingResponse
 
 from ..collision_queries import query_collision_markers
 from ..config import SimulationConfig
 from ..heatmap import HeatmapQuery, compute_heatmap
+from ..movement import (
+    GoalDirectedMovementAlgorithm,
+    LocalAvoidanceMovementAlgorithm,
+    MovementSystem,
+)
 from ..runtime import SimulationRuntime
+from ..scenarios import SCENARIOS
+from ..state import World
 from ..viewport import ViewportQuery, find_visible_drones
 from .models import (
     CollisionMarkerResponse,
@@ -46,6 +55,109 @@ _runtimes: dict[str, SimulationRuntime] = {}
 #: data; raw positions are truncated to a deterministic prefix and
 #: ``truncated=True`` is reported (see ViewportResponse).
 MAX_VISIBLE_DRONES = 5_000
+
+#: Phase 3B dashboard-stream publication rate bounds/default (Hz). The
+#: simulation tick rate is unaffected by this -- see GET .../stream. 8Hz sits
+#: in the 5-10Hz range CLAUDE.md's Phase 3B scope specifies.
+DEFAULT_STREAM_HZ = 8.0
+MIN_STREAM_HZ = 1.0
+MAX_STREAM_HZ = 20.0
+
+#: Close a stream after this many consecutive frame-build/serialize failures
+#: rather than retrying forever -- a transient error (e.g. a viewport query
+#: racing a reset()) must not spin hot, but must also never propagate up and
+#: kill the SimulationRuntime, which owns no reference to any stream.
+MAX_CONSECUTIVE_STREAM_ERRORS = 5
+
+#: Bound on how long a single ``Request.is_disconnected()`` check may take.
+#: Starlette implements it as a best-effort non-blocking receive() wrapped in
+#: a cancel scope; under some ASGI transports (observed with the test client,
+#: not just a defensive guess) that receive() can fail to yield a checkpoint
+#: promptly and stall. Never let one disconnect check hang the whole
+#: publication loop -- on timeout, assume "still connected" and let the next
+#: loop iteration check again.
+DISCONNECT_CHECK_TIMEOUT_S = 0.05
+
+
+async def _client_disconnected(request: Request) -> bool:
+    try:
+        return await asyncio.wait_for(request.is_disconnected(), timeout=DISCONNECT_CHECK_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return False
+
+#: Active SSE connections per simulation_id, for disconnect-cleanup
+#: verification (see tests/test_stream.py) and duplicate-connection
+#: diagnostics. Incremented/decremented only in the stream generator's
+#: try/finally, so it is accurate even when a client disconnects mid-frame.
+_stream_connection_counts: dict[str, int] = {}
+
+
+def _default_goal_positions(config: SimulationConfig, positions: np.ndarray) -> np.ndarray:
+    """Reflect each starting position through the world center.
+
+    Same idea already used by ``scenarios.rare_collision_background`` for its
+    background drones -- a distant, reproducible destination with no
+    dependency on the chosen policy. Used here only when a caller asks for
+    ``policy=`` on a world that has no scenario-provided goals of its own
+    (plain ``num_drones``-style creation, or a scenario factory that doesn't
+    set ``goal_positions``), so ``GoalDirectedMovementAlgorithm``/
+    ``LocalAvoidanceMovementAlgorithm`` always have somewhere to steer toward.
+    This lives here (not in scenarios.py) since it's Phase 3B API-layer
+    orchestration, not a new scenario.
+    """
+    center = (config.bounds_min_arr + config.bounds_max_arr) / 2.0
+    return (2.0 * center[None, :] - positions.astype(np.float64)).astype(np.float32)
+
+
+def _build_movement_system(policy: Optional[str]) -> Optional[MovementSystem]:
+    """Build the ``MovementSystem`` for a requested policy, or ``None`` for
+    the Phase 3A default (Random/Scripted, unmodified)."""
+    if policy is None:
+        return None
+    if policy == "goal_directed":
+        algo = GoalDirectedMovementAlgorithm()
+    elif policy == "local_avoidance":
+        algo = LocalAvoidanceMovementAlgorithm()
+    else:  # pragma: no cover - Literal type already rejects anything else
+        raise ValueError(f"unknown policy {policy!r}")
+    return MovementSystem(policies={algo.policy_id: algo})
+
+
+def _build_world_factory(req: CreateSimulationRequest):
+    """Build the ``world_factory`` for a requested scenario/policy combination.
+
+    Returns ``None`` for the Phase 3A default path (no scenario, no policy),
+    so ``SimulationRuntime`` falls back to its own ``World.create(config)``
+    exactly as before. A pure function of ``config`` (no captured mutable
+    state) so ``SimulationRuntime.reset()`` reproduces the identical initial
+    world on every call -- required for the "same seed stays reproducible"
+    acceptance criterion.
+    """
+    if req.scenario is None and req.policy is None:
+        return None
+
+    scenario_name = req.scenario
+    policy = req.policy
+    policy_id = None
+    if policy == "goal_directed":
+        policy_id = GoalDirectedMovementAlgorithm.policy_id
+    elif policy == "local_avoidance":
+        policy_id = LocalAvoidanceMovementAlgorithm.policy_id
+
+    def factory(config: SimulationConfig) -> World:
+        if scenario_name is not None:
+            world = SCENARIOS[scenario_name](config).world
+        else:
+            world = World.create(config)
+
+        if policy_id is not None:
+            state = world.state
+            state.movement_policy_ids = np.full(state.num_drones, policy_id, dtype=np.int32)
+            if state.goal_positions is None:
+                state.goal_positions = _default_goal_positions(config, state.positions)
+        return world
+
+    return factory
 
 
 def reset_registry() -> None:
@@ -98,7 +210,11 @@ def create_simulation(req: CreateSimulationRequest) -> SimulationStatusResponse:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    _runtimes[simulation_id] = SimulationRuntime(simulation_id, config)
+    movement = _build_movement_system(req.policy)
+    world_factory = _build_world_factory(req)
+    _runtimes[simulation_id] = SimulationRuntime(
+        simulation_id, config, movement=movement, world_factory=world_factory
+    )
     return _status_response(_runtimes[simulation_id])
 
 
@@ -281,41 +397,18 @@ def get_metrics(simulation_id: str) -> MetricsResponse:
     return MetricsResponse(simulation_id=simulation_id, tick=snapshot.tick, metrics=snapshot.metrics)
 
 
-@router.get("/simulations/{simulation_id}/frame")
-def get_frame(
-    simulation_id: str,
-    x_min: float = Query(...),
-    x_max: float = Query(...),
-    y_min: float = Query(...),
-    y_max: float = Query(...),
-    z_min: Optional[float] = Query(None),
-    z_max: Optional[float] = Query(None),
-    x_bins: int = Query(60, gt=0),
-    y_bins: int = Query(60, gt=0),
-) -> Response:
-    """Combined viewport-driven frame: heatmap + collision markers + metrics
-    + timing measurements, computed from ONE ``get_snapshot()`` call.
+def _build_frame_components(
+    runtime: SimulationRuntime, viewport: ViewportQuery, heatmap_query: HeatmapQuery
+) -> tuple[dict, dict, int]:
+    """One snapshot read -> (payload dict without timings, partial timings, tick).
 
-    This is what the browser page polls -- reusing one snapshot across all
-    four kinds of query (instead of the four separate round trips of
-    ``/viewport`` + ``/heatmap`` + ``/collisions`` + ``/metrics``) means every
-    field in the response is guaranteed to describe the same tick, and avoids
-    reacquiring the runtime lock four times per refresh. Never returns raw
-    drone positions (use ``/viewport`` explicitly for those).
+    Shared by ``GET /frame`` and ``GET /stream`` so both build a dashboard
+    frame from the exact same query logic -- one ``get_snapshot_and_status_with_lock_wait()``
+    call, then heatmap/collision queries against that single already-published
+    snapshot, outside the lock. Neither endpoint recomputes or reclassifies
+    anything: this only reads what ``Simulation.step()`` already produced.
+    Never returns raw drone positions (use ``/viewport`` explicitly for those).
     """
-    t_start = time.perf_counter()
-    runtime = _get_runtime(simulation_id)
-    viewport = _build_viewport(x_min, x_max, y_min, y_max, z_min, z_max)
-    try:
-        heatmap_query = HeatmapQuery(viewport=viewport, x_bins=x_bins, y_bins=y_bins)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    # Single lock acquisition for BOTH snapshot and status -- see
-    # get_snapshot_and_status_with_lock_wait()'s docstring for why calling
-    # get_snapshot_with_lock_wait() + get_status() separately (the previous
-    # implementation) was a real, unmeasured second lock-wait, not just a
-    # style choice.
     snapshot, status, lock_wait_ms = runtime.get_snapshot_and_status_with_lock_wait()
 
     t0 = time.perf_counter()
@@ -326,7 +419,7 @@ def get_frame(
 
     tick_timings = runtime.get_last_timings()
     payload = {
-        "simulation_id": simulation_id,
+        "simulation_id": runtime.simulation_id,
         "status": status.status.value,
         "tick": snapshot.tick,
         "num_visible_drones": heatmap.num_drones_included,
@@ -347,13 +440,63 @@ def get_frame(
             for m in markers
         ],
         "metrics": snapshot.metrics,
-        # "timings" deliberately omitted here: serialization_ms/total_request_ms
-        # describe the cost of producing this very payload, so they can't be
-        # computed until AFTER it's serialized (see below). Adding the whole
-        # "timings" block to the response is a second, separate, tiny dump +
-        # string concat rather than re-dumping this (potentially large)
-        # heatmap/markers payload a second time just to add 7 floats.
     }
+    partial_timings = {
+        "sim_step_ms": tick_timings.sim_step_ms,
+        "snapshot_build_ms": tick_timings.snapshot_build_ms,
+        "lock_wait_ms": lock_wait_ms,
+        "heatmap_ms": (t1 - t0) * 1e3,
+        "collisions_ms": (t2 - t1) * 1e3,
+    }
+    return payload, partial_timings, snapshot.tick
+
+
+def _splice_timings(body_without_timings: str, timings: dict) -> str:
+    """Append a ``"timings"`` key to an already-serialized payload without
+    re-dumping it -- see ``get_frame()``'s docstring for why this exists."""
+    return body_without_timings[:-1] + ',"timings":' + json.dumps(timings) + "}"
+
+
+@router.get("/simulations/{simulation_id}/frame")
+def get_frame(
+    simulation_id: str,
+    x_min: float = Query(...),
+    x_max: float = Query(...),
+    y_min: float = Query(...),
+    y_max: float = Query(...),
+    z_min: Optional[float] = Query(None),
+    z_max: Optional[float] = Query(None),
+    x_bins: int = Query(60, gt=0),
+    y_bins: int = Query(60, gt=0),
+) -> Response:
+    """Combined viewport-driven frame: heatmap + collision markers + metrics
+    + timing measurements, computed from ONE ``get_snapshot()`` call.
+
+    This is what the browser page polls -- reusing one snapshot across all
+    four kinds of query (instead of the four separate round trips of
+    ``/viewport`` + ``/heatmap`` + ``/collisions`` + ``/metrics``) means every
+    field in the response is guaranteed to describe the same tick, and avoids
+    reacquiring the runtime lock four times per refresh. Never returns raw
+    drone positions (use ``/viewport`` explicitly for those). See
+    ``GET .../stream`` for the pushed (SSE) equivalent of this same frame.
+    """
+    t_start = time.perf_counter()
+    runtime = _get_runtime(simulation_id)
+    viewport = _build_viewport(x_min, x_max, y_min, y_max, z_min, z_max)
+    try:
+        heatmap_query = HeatmapQuery(viewport=viewport, x_bins=x_bins, y_bins=y_bins)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # _build_frame_components() makes the single lock acquisition for BOTH
+    # snapshot and status -- see get_snapshot_and_status_with_lock_wait()'s
+    # docstring for why calling get_snapshot_with_lock_wait() + get_status()
+    # separately (the previous implementation) was a real, unmeasured second
+    # lock-wait, not just a style choice.
+    payload, partial_timings, _tick = _build_frame_components(runtime, viewport, heatmap_query)
+    # "timings" deliberately left out of payload here: serialization_ms/
+    # total_request_ms describe the cost of producing this very payload, so
+    # they can't be computed until AFTER it's serialized (see _splice_timings).
 
     # The previous implementation dumped the equivalent of this same payload
     # TWICE per request: once into a variable used only to measure
@@ -367,18 +510,129 @@ def get_frame(
     body_without_timings = json.dumps(payload)
     t4 = time.perf_counter()
     timings = {
-        "sim_step_ms": tick_timings.sim_step_ms,
-        "snapshot_build_ms": tick_timings.snapshot_build_ms,
-        "lock_wait_ms": lock_wait_ms,
-        "heatmap_ms": (t1 - t0) * 1e3,
-        "collisions_ms": (t2 - t1) * 1e3,
+        **partial_timings,
         "serialization_ms": (t4 - t3) * 1e3,
         "total_request_ms": (t4 - t_start) * 1e3,
     }
-    # payload is a non-empty dict, so json.dumps always renders it as
-    # '{...}' with no trailing whitespace -- stripping the final '}' and
-    # appending the "timings" field (a second, ~7-float dump, negligible next
-    # to the payload above) is a safe, simple way to add one more top-level
-    # key without re-serializing everything already in body_without_timings.
-    body = body_without_timings[:-1] + ',"timings":' + json.dumps(timings) + "}"
+    body = _splice_timings(body_without_timings, timings)
     return Response(content=body, media_type="application/json")
+
+
+def _build_and_serialize_stream_frame(
+    runtime: SimulationRuntime, viewport: ViewportQuery, heatmap_query: HeatmapQuery, seq: int
+) -> tuple[str, int]:
+    """Build one dashboard frame and serialize it, returning ``(body, tick)``.
+
+    Runs entirely off the shared ``_build_frame_components()`` (same query
+    logic as ``/frame``) so streaming never becomes a second, competing
+    visualization pipeline. Called via ``asyncio.to_thread`` by the stream
+    generator below so the numpy/JSON work never blocks the asyncio event
+    loop other requests (including other open streams) are served from.
+    """
+    t_start = time.perf_counter()
+    payload, partial_timings, tick = _build_frame_components(runtime, viewport, heatmap_query)
+    payload["seq"] = seq
+    payload["server_time"] = time.time()
+
+    t0 = time.perf_counter()
+    body_without_timings = json.dumps(payload)
+    t1 = time.perf_counter()
+    timings = {
+        **partial_timings,
+        "serialization_ms": (t1 - t0) * 1e3,
+        "generation_ms": (t1 - t_start) * 1e3,
+    }
+    return _splice_timings(body_without_timings, timings), tick
+
+
+def _sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@router.get("/simulations/{simulation_id}/stream")
+async def stream_simulation(
+    request: Request,
+    simulation_id: str,
+    x_min: float = Query(...),
+    x_max: float = Query(...),
+    y_min: float = Query(...),
+    y_max: float = Query(...),
+    z_min: Optional[float] = Query(None),
+    z_max: Optional[float] = Query(None),
+    x_bins: int = Query(60, gt=0),
+    y_bins: int = Query(60, gt=0),
+    hz: float = Query(DEFAULT_STREAM_HZ, ge=MIN_STREAM_HZ, le=MAX_STREAM_HZ),
+) -> StreamingResponse:
+    """Server-Sent Events stream of the same dashboard frame ``/frame`` returns,
+    pushed at a bounded, configurable rate (``hz``, default 8) independent of
+    the simulation's own tick rate.
+
+    Each frame is built fresh from whatever the ``SimulationRuntime`` has most
+    recently published -- there is no queue of pending frames anywhere in this
+    endpoint. A slow client therefore never grows a backlog: the next time its
+    connection is ready for more data, this generator fetches and sends
+    whatever tick is *then* current, silently superseding any ticks that
+    happened in between (the "skip old frames, always send the latest" policy
+    the acceptance criteria ask for). The numpy/JSON work for each frame runs
+    via ``asyncio.to_thread`` so it can never block this process's asyncio
+    event loop -- and therefore never delays any other concurrent request,
+    including a different simulation's own stream.
+    """
+    runtime = _get_runtime(simulation_id)  # 404 raised here, before the stream ever opens
+    viewport = _build_viewport(x_min, x_max, y_min, y_max, z_min, z_max)
+    try:
+        heatmap_query = HeatmapQuery(viewport=viewport, x_bins=x_bins, y_bins=y_bins)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    interval_s = 1.0 / hz
+
+    async def event_generator():
+        _stream_connection_counts[simulation_id] = _stream_connection_counts.get(simulation_id, 0) + 1
+        seq = 0
+        consecutive_errors = 0
+        try:
+            while True:
+                if await _client_disconnected(request):
+                    break
+                if simulation_id not in _runtimes:
+                    # Deleted mid-stream (DELETE /simulations/{id}) -- our
+                    # `runtime` reference is still a valid, harmless object
+                    # (its background thread was already stopped by
+                    # shutdown() before removal), but nothing should keep
+                    # polling it. Tell the client why, then stop cleanly.
+                    yield _sse_event("closed", {"reason": "simulation_deleted"})
+                    break
+
+                seq += 1
+                try:
+                    body, _tick = await asyncio.to_thread(
+                        _build_and_serialize_stream_frame, runtime, viewport, heatmap_query, seq
+                    )
+                except Exception:
+                    # A bad frame (e.g. a viewport query racing a reset())
+                    # must never kill the SimulationRuntime or the whole
+                    # stream outright -- retry a bounded number of times.
+                    consecutive_errors += 1
+                    seq -= 1
+                    if consecutive_errors >= MAX_CONSECUTIVE_STREAM_ERRORS:
+                        yield _sse_event("error", {"detail": "repeated frame errors, closing stream"})
+                        break
+                    await asyncio.sleep(interval_s)
+                    continue
+                consecutive_errors = 0
+
+                yield f"id: {seq}\ndata: {body}\n\n"
+                await asyncio.sleep(interval_s)
+        finally:
+            remaining = _stream_connection_counts.get(simulation_id, 1) - 1
+            if remaining <= 0:
+                _stream_connection_counts.pop(simulation_id, None)
+            else:
+                _stream_connection_counts[simulation_id] = remaining
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

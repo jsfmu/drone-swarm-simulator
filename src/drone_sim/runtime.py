@@ -31,14 +31,16 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Deque, Dict
+from typing import Callable, Deque, Dict
 
 import numpy as np
 
 from .collisions import DetectionResult
 from .config import SimulationConfig
+from .movement import MovementSystem
 from .simulation import Simulation
 from .snapshot import SimulationSnapshot, build_snapshot
+from .state import World
 
 #: How many of the most recent tick times to keep for median/p95 display.
 #: Bounded so RunningMetrics.summary() stays O(1) regardless of how long the
@@ -145,21 +147,44 @@ class RunningMetrics:
 
 
 class SimulationRuntime:
-    """Owns one ``Simulation`` and advances it independently of any request."""
+    """Owns one ``Simulation`` and advances it independently of any request.
 
-    def __init__(self, simulation_id: str, config: SimulationConfig) -> None:
+    ``movement``/``world_factory`` are optional, additive hooks for Phase 3B's
+    policy/scenario selection (see ``api/routes.py``'s ``_build_movement_system()``/
+    ``_build_world_factory()``) -- ``SimulationRuntime`` itself knows nothing
+    about policies or scenarios, it only passes these straight through to
+    ``Simulation`` exactly as ``Simulation`` already accepts them. Leaving both
+    ``None`` (every pre-Phase-3B call site) reproduces the exact previous
+    behavior: ``Simulation(config)`` with its own default ``MovementSystem()``
+    and ``World.create(config)``. ``world_factory`` must be a pure function of
+    ``config`` (no closures over mutable state) so ``reset()`` reproducing the
+    identical initial world by calling it again stays deterministic.
+    """
+
+    def __init__(
+        self,
+        simulation_id: str,
+        config: SimulationConfig,
+        movement: MovementSystem | None = None,
+        world_factory: Callable[[SimulationConfig], World] | None = None,
+    ) -> None:
         self.simulation_id = simulation_id
         self._config = config
+        self._movement = movement
+        self._world_factory = world_factory
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()  # set == paused
 
-        self._sim = Simulation(config)
+        self._sim = Simulation(config, movement=movement, world=self._make_world(config))
         self._status = RuntimeStatus.CREATED
         self._running_metrics = RunningMetrics()
         self._last_timings = TickTimings()
         self._snapshot: SimulationSnapshot = build_snapshot(simulation_id, self._sim, None, {})
+
+    def _make_world(self, config: SimulationConfig) -> World | None:
+        return None if self._world_factory is None else self._world_factory(config)
 
     # ------------------------------------------------------------ lifecycle
     def start(self, tick_interval_s: float = 0.0) -> None:
@@ -209,7 +234,7 @@ class SimulationRuntime:
                 raise RuntimeError(
                     f"simulation {self.simulation_id!r} is running -- pause it before resetting"
                 )
-            self._sim = Simulation(self._config)
+            self._sim = Simulation(self._config, movement=self._movement, world=self._make_world(self._config))
             self._status = RuntimeStatus.CREATED
             self._running_metrics = RunningMetrics()
             self._last_timings = TickTimings()
@@ -269,7 +294,7 @@ class SimulationRuntime:
                 simulation_id=self.simulation_id,
                 status=self._status,
                 tick=snapshot.tick,
-                num_drones=self._config.num_drones,
+                num_drones=self._sim.world.state.num_drones,
             )
         return snapshot, state, (t1 - t0) * 1e3
 
@@ -279,7 +304,7 @@ class SimulationRuntime:
                 simulation_id=self.simulation_id,
                 status=self._status,
                 tick=self._snapshot.tick,
-                num_drones=self._config.num_drones,
+                num_drones=self._sim.world.state.num_drones,
             )
 
     def get_last_timings(self) -> TickTimings:

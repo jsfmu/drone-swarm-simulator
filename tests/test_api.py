@@ -237,3 +237,33 @@ def test_static_browser_page_loads_successfully(client):
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
     assert "Drone Collision Simulator" in resp.text
+
+
+def test_cors_allows_the_vite_dev_server_origin(client):
+    """Regression guard: the Phase 3B React dashboard runs on its own Vite
+    dev server (a different origin from this API), so a request carrying an
+    Origin header must get back a matching Access-Control-Allow-Origin --
+    otherwise the browser blocks it before any handler runs, surfacing in
+    the frontend as a generic 'TypeError: Failed to fetch'."""
+    origin = "http://localhost:5173"
+    resp = client.get("/simulations/does-not-exist", headers={"Origin": origin})
+    assert resp.headers.get("access-control-allow-origin") == origin
+
+
+def test_cors_preflight_succeeds_for_the_vite_dev_server_origin(client):
+    origin = "http://localhost:5173"
+    resp = client.options(
+        "/simulations",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") == origin
+
+
+def test_cors_rejects_an_unrelated_origin(client):
+    resp = client.get("/simulations/does-not-exist", headers={"Origin": "http://evil.example.com"})
+    assert "access-control-allow-origin" not in {k.lower() for k in resp.headers}

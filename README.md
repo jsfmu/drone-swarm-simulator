@@ -6,20 +6,22 @@ The project combines simulation, spatial indexing, collision detection, AI-based
 
 ## Project status
 
-**Current phase:** Phase 3 — Visualization and APIs
+**Current phase:** Phase 3B — Real-time streaming and a bounded React dashboard
 
 - Phase 1: Local simulation kernel — complete
 - Phase 2: Deterministic movement intelligence and scenario control — complete
 - Phase 3A: Snapshot, viewport-query API, and minimal browser visualization — complete
+- Phase 3B: SSE streaming endpoint + React/Canvas dashboard (first bounded version) — complete
 
-Phase 1 (local simulation kernel) and Phase 2 (AI and scenario control — batched movement policies, trajectory prediction, local collision avoidance, controlled rare-collision scenarios, collision-rate validation) are implemented, tested, and unchanged by Phase 3A. Phase 3A (snapshot layer, background simulation runtime, vectorized viewport/heatmap/collision-marker queries, a small FastAPI app, and a minimal static browser page) is now also implemented and tested — see [Phase 3A: local visualization API](#phase-3a-local-visualization-api) below. A local Matplotlib debug viewer (a separate, Phase-1-era prototype, not part of Phase 3A) remains available too. Online reinforcement learning, `NeuralAvoidanceMovementAlgorithm` (evaluated and removed — see below), distributed workers, Redis, real-time streaming, and the production React/Canvas/WebGL dashboard are out of scope for this implementation.
+Phase 1 (local simulation kernel) and Phase 2 (AI and scenario control — batched movement policies, trajectory prediction, local collision avoidance, controlled rare-collision scenarios, collision-rate validation) are implemented, tested, and unchanged by Phase 3A/3B. Phase 3A (snapshot layer, background simulation runtime, vectorized viewport/heatmap/collision-marker queries, a small FastAPI app, and a minimal static browser page) remains as documented below. Phase 3B adds a `GET /simulations/{id}/stream` Server-Sent-Events endpoint and a small React + Canvas dashboard on top of Phase 3A's existing query logic — see [Phase 3B: real-time streaming and dashboard](#phase-3b-real-time-streaming-and-dashboard) below. Online reinforcement learning, `NeuralAvoidanceMovementAlgorithm` (evaluated and removed — see below), distributed workers, Redis, databases, authentication, cloud deployment, GPU simulation, and WebGL rendering remain out of scope.
 
-Four separate benchmarks measure four different workloads — do not read one's numbers as covering another:
+Five separate benchmarks measure five different workloads — do not read one's numbers as covering another:
 
 - `benchmarks/benchmark_simulation.py` measures the **Phase 1 tick path** (Random/Scripted policies, no `requires_context` policy registered — no pre-movement grid, prediction, or context construction). Its 100,000-drone, ~7.3 ticks/second result reflects *only* this path.
 - `benchmarks/benchmark_avoidance.py` measures the **full Phase 2 avoidance tick path** (`GoalDirectedMovementAlgorithm` vs. `LocalAvoidanceMovementAlgorithm`, including the pre-movement spatial hash, trajectory prediction, `MovementContext` construction, and the extra post-movement grid rebuild). It completes successfully at 100,000 drones for both policies — see [Phase 2 avoidance benchmark](#phase-2-avoidance-benchmark) below for measured throughput, the per-stage timing breakdown, and the dominant bottleneck.
 - `benchmarks/benchmark_visualization.py` measures **Phase 3A visualization-query cost** (snapshot creation, viewport filtering, heatmap generation, collision-marker queries, JSON-ready conversion) with simulation ticks explicitly excluded from every timed region — see [Phase 3A visualization-query benchmark](#phase-3a-visualization-query-benchmark) below.
 - `benchmarks/benchmark_viewer_comparison.py` measures **why an active browser session could run substantially slower than the Matplotlib viewer or the bounded pipeline-regression benchmark** — isolated vs. concurrent execution, a full configuration audit, and the orphaned-runtime-thread root cause — see [Browser vs. Matplotlib viewer: isolated-vs-concurrent investigation](#browser-vs-matplotlib-viewer-isolated-vs-concurrent-investigation) below.
+- `benchmarks/benchmark_streaming.py` measures **Phase 3B streaming cost**: simulation tick throughput with vs. without an active SSE client, publication-rate bookkeeping, and per-frame payload/timing stats — see [Phase 3B benchmark](#phase-3b-benchmark) below.
 
 ## Getting started
 
@@ -39,7 +41,7 @@ pip install -e .
 python -m pytest -q
 ```
 
-This picks up `src/` and `tests/` automatically via `pyproject.toml`'s `pythonpath`/`testpaths` settings — no manual `PYTHONPATH` needed. 218 tests as of the browser/Matplotlib viewer investigation (205 from Phase 1/2/3A and the tick-rate regression fix — see below — plus 13 more from this investigation: the `DELETE /simulations/{id}` endpoint stopping and removing a runtime, `/frame` no longer double-serializing its payload or making a second unmeasured lock acquisition, `SpatialHashGrid.occupancy_stats()`, and the `TickProfile` occupancy/pair-count fields). Of the 205: 142 from Phase 1/2; 50 from the initial Phase 3A build covering the snapshot layer, viewport/heatmap/collision-marker queries, the background runtime, and the FastAPI endpoints; 13 more from the tick-rate regression fix covering `RunningMetrics`, tick-timing isolation, lock fairness, and `/frame` snapshot reuse.
+This picks up `src/` and `tests/` automatically via `pyproject.toml`'s `pythonpath`/`testpaths` settings — no manual `PYTHONPATH` needed. 218 tests as of the browser/Matplotlib viewer investigation (205 from Phase 1/2/3A and the tick-rate regression fix — see below — plus 13 more from this investigation: the `DELETE /simulations/{id}` endpoint stopping and removing a runtime, `/frame` no longer double-serializing its payload or making a second unmeasured lock acquisition, `SpatialHashGrid.occupancy_stats()`, and the `TickProfile` occupancy/pair-count fields). Of the 205: 142 from Phase 1/2; 50 from the initial Phase 3A build covering the snapshot layer, viewport/heatmap/collision-marker queries, the background runtime, and the FastAPI endpoints; 13 more from the tick-rate regression fix covering `RunningMetrics`, tick-timing isolation, lock fairness, and `/frame` snapshot reuse. **241 tests as of Phase 3B** (was 218 above, plus the API-client and remote-viewer additions documented in `CLAUDE.md`'s session notes, plus 14 new in `tests/test_stream.py` for the SSE streaming endpoint and 3 new CORS regression tests in `test_api.py` — see [Phase 3B: real-time streaming and dashboard](#phase-3b-real-time-streaming-and-dashboard) below). The frontend has its own separate Vitest suite (39 tests as of Phase 3B) under `frontend/`, run with `npm test`, not part of `python -m pytest`.
 
 **3. Run the benchmarks**
 
@@ -84,6 +86,29 @@ uvicorn drone_sim.api.app:app --reload
 ```
 
 Then open **http://127.0.0.1:8000/** in a browser. See [Phase 3A: local visualization API](#phase-3a-local-visualization-api) below for endpoint details, snapshot-consistency behavior, and known limitations.
+
+**6. Run the Phase 3B React dashboard**
+
+```bash
+# terminal 1 -- the same backend as step 5 (the dashboard talks to it over
+# REST + SSE, exactly like static/index.html does over REST + polling)
+uvicorn drone_sim.api.app:app
+
+# terminal 2
+cd frontend
+npm install
+npm run dev
+```
+
+Then open the URL Vite prints (default **http://localhost:5173/**). Set
+`VITE_API_BASE_URL` if the backend isn't at `http://127.0.0.1:8000`. See
+[Phase 3B: real-time streaming and dashboard](#phase-3b-real-time-streaming-and-dashboard)
+below for architecture, streaming design, and known limitations.
+
+```bash
+cd frontend && npm test              # Vitest: pure-logic unit tests
+python benchmarks/benchmark_streaming.py   # Phase 3B streaming cost: 1k/10k/100k
+```
 
 ## Goals
 
@@ -247,7 +272,18 @@ drone-collision-simulator/
 │       ├── spatial_hash.py
 │       ├── collisions.py
 │       ├── metrics.py
-│       └── visualization.py
+│       ├── visualization.py
+│       ├── snapshot.py           (Phase 3A)
+│       ├── runtime.py            (Phase 3A; policy/scenario hooks added Phase 3B)
+│       ├── viewport.py           (Phase 3A)
+│       ├── heatmap.py            (Phase 3A)
+│       ├── collision_queries.py  (Phase 3A)
+│       ├── api_client.py         (Phase 3A, --remote viewer support)
+│       └── api/                  (Phase 3A; stream endpoint added Phase 3B)
+│           ├── app.py
+│           ├── models.py
+│           ├── routes.py
+│           └── static/index.html
 ├── tests/
 │   ├── test_movement.py
 │   ├── test_trajectory.py
@@ -256,11 +292,25 @@ drone-collision-simulator/
 │   ├── test_boundaries.py
 │   ├── test_spatial_hash.py
 │   ├── test_collisions.py
-│   └── test_visualization.py
+│   ├── test_visualization.py
+│   ├── test_snapshot.py, test_viewport.py, test_heatmap.py,
+│   │   test_collision_queries.py, test_runtime.py, test_runtime_timing.py,
+│   │   test_api.py, test_api_client.py       (Phase 3A)
+│   └── test_stream.py                        (Phase 3B)
 ├── benchmarks/
-│   └── benchmark_simulation.py
-└── scripts/
-    └── run_visualizer.py
+│   ├── benchmark_simulation.py
+│   ├── benchmark_avoidance.py
+│   ├── benchmark_visualization.py
+│   ├── benchmark_viewer_comparison.py
+│   ├── benchmark_pipeline_regression.py
+│   └── benchmark_streaming.py     (Phase 3B)
+├── scripts/
+│   └── run_visualizer.py
+└── frontend/                      (Phase 3B -- React + Vite dashboard)
+    ├── package.json
+    ├── vite.config.js
+    └── src/
+        ├── api.js, hooks/, utils/, components/, __tests__/
 ```
 
 ## Roadmap
@@ -306,10 +356,24 @@ Neural avoidance is not currently planned.
 
 See [Phase 3A: local visualization API](#phase-3a-local-visualization-api) below for details, endpoints, and limitations.
 
-### Phase 3B and later: real-time streaming, production dashboard
+### Phase 3B: real-time streaming and dashboard (first bounded version, complete)
 
-- Real-time state and metrics updates (WebSocket/SSE)
-- The React/Canvas/WebGL production dashboard
+- ~~`GET /simulations/{id}/stream` -- Server-Sent Events, bounded configurable
+  publication rate, independent of the simulation tick rate~~
+- ~~A small React + Canvas dashboard (`frontend/`): heatmap + collision-marker
+  rendering, simulation controls, policy/scenario selection, live metrics,
+  connection status~~
+- ~~Policy/scenario selection via `POST /simulations`'s `policy`/`scenario`
+  fields, wired through `SimulationRuntime`'s new optional `movement`/
+  `world_factory` hooks -- no changes to any movement algorithm or scenario
+  factory~~
+
+See [Phase 3B: real-time streaming and dashboard](#phase-3b-real-time-streaming-and-dashboard)
+below for architecture, streaming design, benchmark results, and limitations.
+WebGL rendering remains a documented future optimization, not implemented --
+this phase renders on Canvas 2D. A shared multi-client broadcast layer,
+distributed workers, Redis, a database, authentication, and cloud deployment
+remain out of scope (see that section's "Known limitations").
 
 ### Phase 4: Distributed execution
 
@@ -341,11 +405,11 @@ See [Phase 3A: local visualization API](#phase-3a-local-visualization-api) below
 | Layer | Initial choice |
 | --- | --- |
 | Simulation | Python 3.11+ and NumPy |
-| Testing | pytest |
+| Testing | pytest (backend), Vitest (frontend) |
 | Benchmarking | Python timing and profiling tools |
-| Backend, later | FastAPI |
-| Streaming, later | WebSocket or SSE |
-| Frontend, later | React with Canvas or WebGL rendering |
+| Backend | FastAPI |
+| Streaming | Server-Sent Events (`GET .../stream`, Phase 3B) |
+| Frontend | React + Canvas 2D (`frontend/`, Phase 3B). WebGL remains a documented future optimization, not implemented. |
 | Messaging, later | Redis only if distributed measurements justify it |
 
 ## Phase 2: AI and scenario control
@@ -1216,6 +1280,339 @@ full scale.
   proportionally larger for a very small/fast simulation (e.g. a few
   hundred drones with sub-millisecond ticks) — measured trade-off, not
   something the code auto-tunes.
+
+## Phase 3B: real-time streaming and dashboard
+
+The first bounded version of Phase 3B: a pushed (SSE) alternative to Phase
+3A's polled `/frame`, and a small React + Canvas dashboard that proves five
+things — drones move, density changes over time, collisions are detected and
+located correctly, the existing avoidance policies affect results, and the
+simulation stays fast while a dashboard is attached. It adds no new
+simulation, collision-detection, movement, or spatial-hashing logic; no
+distributed workers, Redis, database, auth, cloud deployment, GPU simulation,
+or WebGL. Canvas (not WebGL) renders the heatmap and collision markers;
+WebGL remains a documented future optimization only.
+
+### Architecture
+
+```text
+Simulation runtime (background thread, unchanged from Phase 3A)
+    -> immutable SimulationSnapshot (one completed tick)
+    -> _build_frame_components() -- the SAME function GET /frame already used,
+       now shared by both endpoints
+    -> GET /simulations/{id}/frame   (existing, unchanged behavior, polled)
+    -> GET /simulations/{id}/stream  (new, pushed via Server-Sent Events)
+    -> React dashboard (frontend/): EventSource -> imperative Canvas draw
+       + a small metrics/connection-status React state slice
+```
+
+`routes.py`'s `_build_frame_components()` is the one shared function both
+endpoints build a dashboard frame from — extracted from `/frame`'s existing
+logic rather than duplicated, so there is exactly one visualization pipeline,
+not two competing ones. `/frame` is unchanged behaviorally (same tests, same
+call pattern: one `get_snapshot_and_status_with_lock_wait()`, one
+`json.dumps()`) and remains the fallback/testing surface the acceptance
+criteria ask for.
+
+**CORS.** Phase 3A's `static/index.html` was served *by* this same FastAPI
+app (`app.mount("/", StaticFiles(...))`), so every request was same-origin
+and CORS never came up. The Phase 3B dashboard runs on its own Vite dev
+server (default `http://localhost:5173`) — a genuinely different origin from
+the API (default `http://127.0.0.1:8000`) — so `create_app()` (`app.py`) now
+adds `CORSMiddleware`, scoped to `http://(localhost|127.0.0.1)(:port)?` (not
+`*`, since this is a local dev tool with no auth/cookies, not a public
+deployment). Without it, the browser blocks every REST call and the SSE
+connection before any handler runs, surfacing in the dashboard as a generic
+`TypeError: Failed to fetch` with no server-side log at all (the request
+never reaches FastAPI) — this was hit and fixed during this session; see
+`tests/test_api.py`'s three `test_cors_*` tests.
+
+### Streaming endpoint
+
+```text
+GET /simulations/{id}/stream?x_min=&x_max=&y_min=&y_max=&x_bins=&y_bins=&hz=
+```
+
+Server-Sent Events (`text/event-stream`), chosen over WebSocket because the
+dashboard's primary traffic is server-to-client; REST stays the command
+channel for create/start/pause/resume/step/reset/delete, unchanged. `hz`
+(default 8, range 1-20) is the **publication rate**, independent of the
+simulation's own tick rate — exactly like `/frame`'s polling interval was
+independent of it in Phase 3A, just pushed instead of pulled now. Each event
+is a JSON object shaped like `/frame`'s response plus `seq` (a per-connection
+monotonic counter) and `server_time`.
+
+**No queue anywhere in this design.** Each loop iteration in the per
+-connection async generator fetches whatever the `SimulationRuntime` has
+*currently* published, builds one frame (via `asyncio.to_thread`, so the
+numpy/JSON work never blocks the asyncio event loop other requests —
+including other open streams — are served from), sends it, sleeps `1/hz`,
+and repeats. A slow client therefore never accumulates a backlog: the next
+time it's ready, this generator sends whatever tick is *then* current,
+silently superseding whatever happened in between. This is verified directly
+by `tests/test_stream.py::test_stream_latest_frame_skips_intermediate_ticks`
+(consecutive received ticks jump by more than 1 when the sim ticks faster
+than the configured `hz`) and `..._bounded_publication_rate` (received frame
+count tracks `hz`, not the much higher tick count).
+
+Handled explicitly:
+- **Client disconnect** — `Request.is_disconnected()`, checked every loop
+  iteration, wrapped in a 50ms `asyncio.wait_for` (see "A test-transport
+  deadlock" below for why the timeout wrapper exists).
+- **Simulation deletion mid-stream** — checked via `simulation_id not in
+  _runtimes` (the registry `DELETE /simulations/{id}` removes the id from)
+  before building each frame; on removal the stream sends one
+  `event: closed` (`{"reason": "simulation_deleted"}`) and returns. The
+  generator's own `runtime` reference stays valid (its thread was already
+  stopped by `shutdown()` before removal), it just stops being polled.
+- **Invalid simulation_id** — `_get_runtime()` raises its normal `404` in the
+  endpoint function itself, before any `StreamingResponse` is created, so an
+  unknown id never even opens a stream.
+- **Stream cleanup / duplicate connections** — `_stream_connection_counts`
+  (a `simulation_id -> open-connection count` dict) is incremented/decremented
+  in the generator's `try`/`finally`, so it is accurate regardless of how the
+  loop exits, and gives `tests/test_stream.py` something concrete to assert
+  cleanup against.
+- **Serialization/frame-build errors** — caught per iteration; a transient
+  failure (e.g. a query racing a `reset()`) retries up to
+  `MAX_CONSECUTIVE_STREAM_ERRORS` (5) times before closing with
+  `event: error`, and never touches or crashes the `SimulationRuntime`, which
+  holds no reference to any stream.
+
+### A test-transport deadlock (worth documenting, not a production bug)
+
+While writing `tests/test_stream.py`, reading the stream through FastAPI's
+`TestClient` (httpx's in-memory `ASGITransport`) deadlocked every time,
+before even the response status was available. Reading httpx's
+`ASGITransport.handle_async_request()` source confirmed why: it awaits the
+whole ASGI app call to *completion* before returning anything to the caller,
+and its mock `receive()` only ever reports `http.disconnect` *after* the
+response is already complete. An endpoint that intentionally never finishes
+until it observes a disconnect can therefore never finish under this
+transport — the transport's own bookkeeping deadlocks, independent of
+anything this endpoint does. `tests/test_api_client.py` had already solved
+the general problem (needing real socket-level HTTP behavior) by running a
+real `uvicorn.Server` in a background thread; `tests/test_stream.py` reuses
+that exact fixture and reads the stream with `urllib.request.urlopen` over a
+genuine socket, where real TCP disconnects are correctly observed.
+
+Separately, `Request.is_disconnected()`'s own implementation cancels a
+non-blocking receive() via an `anyio.CancelScope`, which does not always get
+a chance to unblock promptly under every ASGI transport. `_client_disconnected()`
+(`routes.py`) wraps it in a 50ms `asyncio.wait_for`, treating a timeout as
+"still connected" — a small, defensive bound that also makes the check
+robust in production, not just in tests.
+
+### Policy and scenario selection
+
+`POST /simulations` gained two optional fields on `CreateSimulationRequest`:
+
+```json
+{ "num_drones": 2000, "bounds_max": [500, 500, 100],
+  "policy": "goal_directed" | "local_avoidance" | null,
+  "scenario": "head_on_collision" | "crossing_paths" | "near_miss" | "parallel_safe" |
+              "stationary_obstacle" | "converging_group" | "rare_collision_background" | null }
+```
+
+Both default to `null`, reproducing the exact Phase 3A path
+(`RandomMovementAlgorithm`, `DroneState.generate()`) unchanged. Neither
+`GoalDirectedMovementAlgorithm` nor `LocalAvoidanceMovementAlgorithm` nor any
+`scenarios.py` factory was modified — `routes.py` only gained two small,
+additive helpers:
+
+- `_build_movement_system(policy)` builds a `MovementSystem` with exactly one
+  registered policy (the requested one) when `policy` is set, else returns
+  `None` (Phase 3A's default Random/Scripted registry).
+- `_build_world_factory(req)` returns a pure function of `SimulationConfig`
+  that builds the world via the requested `scenarios.SCENARIOS[name]` factory
+  (or the Phase 3A default `World.create(config)`), then — only if a policy
+  was requested and the world has no scenario-provided `goal_positions` of
+  its own — assigns simple reflective goals (`2*center - position`, the same
+  idea `rare_collision_background`'s own background drones already use) so
+  `GoalDirectedMovementAlgorithm`/`LocalAvoidanceMovementAlgorithm` always
+  have somewhere to steer toward. This lives in the API layer, not
+  `scenarios.py`, since it is Phase 3B orchestration, not a new scenario.
+
+`SimulationRuntime` gained optional `movement`/`world_factory` constructor
+parameters (both `None` by default, reproducing prior behavior exactly) so
+it can pass them straight through to the already-existing
+`Simulation(config, movement=..., world=...)` constructor — `SimulationRuntime`
+itself still knows nothing about policies or scenarios. `world_factory` being
+a pure function of `config` is what keeps `reset()` reproducing the identical
+initial world every time, same as Phase 3A.
+
+One accuracy fix rode along with this: `RuntimeState.num_drones` now reads
+`self._sim.world.state.num_drones` (the live world) instead of
+`self._config.num_drones` — the two can legitimately differ once a scenario
+is selected (e.g. `head_on_collision` always builds a 2-drone world
+regardless of the requested `num_drones`), and status responses must report
+the real count.
+
+The dashboard's PolicyControls component exposes both selectors and clearly
+labels which policy/scenario the current simulation is running (README
+acceptance criterion); running the same seed+scenario+policy combination
+twice is reproducible, verified by
+`tests/test_stream.py::test_stream_same_seed_scenario_policy_reproducible`.
+
+### React dashboard (`frontend/`)
+
+A small Vite + React app, no additional framework or component library:
+
+```text
+frontend/src/
+  api.js                        REST calls (create/start/pause/resume/step/reset/delete)
+  hooks/useSimulationStream.js   EventSource lifecycle -> a small connection-state reducer
+  utils/canvas.js                world<->canvas coordinate math (pure)
+  utils/heatmapDraw.js            heatmap payload -> flat list of drawable rects (pure)
+  utils/markers.js                collision markers -> canvas positions (pure)
+  utils/streamReducer.js          connection-state machine (pure)
+  utils/requestBuilder.js         form state -> POST /simulations body (pure)
+  utils/metricsFormat.js          frame -> ordered {label, value} rows (pure)
+  components/
+    SimulationDashboard.jsx       owns simulationId, form state, wires everything together
+    SimulationControls.jsx        create/start/pause/resume/step/reset/delete + config fields
+    PolicyControls.jsx            policy/scenario selectors + "Running: ..." label
+    SimulationViewport.jsx        ResizeObserver host around HeatmapCanvas
+    HeatmapCanvas.jsx             owns the <canvas>; exposes an imperative drawFrame()
+    MetricsPanel.jsx              renders utils/metricsFormat.js's rows
+    CollisionSummary.jsx          this-tick markers vs. cumulative collisions/near-misses
+    ConnectionStatus.jsx          idle/connecting/open/error/closed indicator
+```
+
+**Canvas redraws happen exactly once per streamed frame, never through React
+state/rerenders.** `useSimulationStream`'s `onmessage` handler calls
+`viewportRef.current.drawFrame(frame, viewport)` directly (a ref to
+`HeatmapCanvas`'s `useImperativeHandle`-exposed method) with the *full* frame
+(heatmap grid + markers) — that data never touches React state. Separately, a
+small `frameMeta` object (tick/status/metrics/timings/seq — no heatmap counts,
+no marker array) is dispatched into the connection-state reducer so
+`MetricsPanel`/`ConnectionStatus`/`CollisionSummary` rerender on a small
+object, not the full payload. No React element is created per drone or per
+heatmap cell; collision markers come only from `frame.markers` (the backend's
+canonical, already-classified list) and are never inferred from rendered
+positions. Per-drone rendering was deliberately left out: the heatmap already
+proves movement/density change tick-to-tick without requesting raw positions,
+consistent with "never stream/render all raw drones by default."
+
+The dashboard is one client among possibly several polling/streaming the same
+backend — `SimulationDashboard`'s `handleCreate()` deletes its own previous
+simulation before creating a replacement, mirroring `static/index.html`'s
+`stopSimulationIfAny` (see "Orphaned runtime threads" above) so repeated
+"Create" clicks don't leak background threads.
+
+### Tests
+
+`tests/test_stream.py` (14 tests, run against a real `uvicorn.Server` — see
+"A test-transport deadlock" above for why): initial valid frame, advancing
+ticks while running, one-snapshot field consistency, behavior while paused,
+client-disconnect cleanup, invalid id -> 404, deleted-mid-stream -> `closed`
+event, bounded publication rate, latest-frame-skips-intermediate-ticks,
+policy selection (both policies), scenario+policy reproducibility across two
+runtimes, and a regression guard that `/frame` and the REST controls are
+unchanged. `frontend/`'s Vitest suite (39 tests, pure logic, no DOM/canvas
+mocking needed): coordinate math and its exact inverse, heatmap-cell geometry
+and color mapping, collision-marker placement, every connection-state
+transition, request-body construction (policy/scenario included only when
+set), and metrics-label correctness (including that this-tick and cumulative
+collision counts are distinct rows, never merged).
+
+### Phase 3B benchmark
+
+`python benchmarks/benchmark_streaming.py` measures, per drone count, an
+in-process poller thread calling the exact same
+`routes._build_and_serialize_stream_frame()` the real endpoint uses against a
+live `SimulationRuntime` (mirroring `benchmark_viewer_comparison.py`'s
+existing concurrent-poller technique rather than a real HTTP round trip,
+since the in-process cost is what's worth isolating here):
+
+```
+duration/phase: 3.0s   configured publish rate: 8.0 Hz   seed: 0
+
+-- 1. Simulation tick throughput: no stream client vs. one stream client --
+  drones   baseline ticks/s  with-stream ticks/s   slowdown
+   1,000             428.23               416.26      1.03x
+  10,000              80.67                81.99      0.98x
+ 100,000               7.00                 7.00      1.00x
+
+-- 2. Publication-rate bookkeeping (independent of simulation throughput above) --
+  drones  configured Hz  actual frames/s  superseded ticks
+   1,000            8.0             8.00             1,189
+  10,000            8.0             7.33               225
+ 100,000            8.0             3.67                10
+
+-- 3. Per-frame payload / timing stats (mean over the measured window) --
+  drones  payload bytes  lock wait ms   serialization ms   generation ms
+   1,000         14,826         0.423              0.184           1.222
+  10,000         21,994         5.759              0.275          18.066
+ 100,000         95,329        29.611              1.045         172.584
+```
+
+**The stream does not measurably slow the simulation loop**: tick throughput
+with one active stream client stayed within ~2-3% of the no-client baseline
+at every scale tested (100,000: identical to two decimal places; 10,000: 2%
+faster, within run-to-run noise; 1,000: 3% slower) — the `asyncio.to_thread`
+offload and the lock being held only for a brief snapshot-and-status read
+both do what they're meant to.
+
+**At 100,000 drones, per-frame generation time (172.6ms mean) is dominated by
+waiting for the runtime lock (29.6ms) plus the underlying tick cost itself
+being slow — not by heatmap/collision-query work or JSON serialization
+(1.0ms).** This is a pre-existing Phase 1 characteristic: at 100,000 drones
+with the default Random-walk policy, a single `Simulation.step()` tick
+already costs on the order of 100-200ms (`benchmarks/benchmark_simulation.py`'s
+~7.3 ticks/second result), so a stream poll landing mid-tick can wait nearly
+a full tick for the lock to free up — the same class of lock contention
+Phase 3A's tick-rate regression investigation already characterized, just now
+visible from the streaming endpoint's perspective too, at a scale where the
+underlying tick cost (not this phase's code) is the bottleneck. `actual
+frames/s` correspondingly drops below the configured 8Hz at 100,000 drones
+(3.67 measured) since the publish loop cannot outrun what the lock allows —
+this is expected, bounded degradation, not a hang or a leak: `superseded_ticks`
+stays low at 100,000 (only 10, since fast lock waits mean few ticks to skip)
+and highest at 1,000 (1,189, where the sim ticks far faster than 8Hz can
+publish) — exactly the "many ticks, few publishes, always-latest" pattern the
+design targets.
+
+Run it yourself: `python benchmarks/benchmark_streaming.py`.
+
+### Known limitations
+
+- No pub/sub or broadcast layer: each SSE connection independently polls and
+  rebuilds its own frame. Two dashboard clients watching the same
+  `simulation_id` each pay the full heatmap/collision/serialization cost
+  rather than sharing one computed frame. Acceptable at this phase's scope
+  (one dashboard is the common case); a shared-frame broadcaster is a
+  reasonable future addition if concurrent multi-client viewing of one
+  simulation becomes a real use case, not something to build speculatively
+  now.
+- No hard write-timeout on a stalled (not cleanly closed) TCP connection —
+  `Request.is_disconnected()` plus real ASGI/TCP-level disconnect detection
+  handles an actual client close; a client that stops reading without
+  closing the socket could leave that one connection's generator loop
+  waiting on a blocked write until the OS/transport eventually notices.
+  Adding an explicit write-timeout would be new infrastructure beyond what
+  this bounded phase requires.
+- Near-miss markers are still not exposed per-tick (only the cumulative
+  `total_near_misses` count, already available from Phase 3A) — consistent
+  with Phase 3A's existing documented limitation; adding per-tick near-miss
+  markers would cost more than "cheaply and correctly" allows within this
+  phase's scope.
+- `mean_candidate_pairs` (a cumulative running mean) is shown in the metrics
+  panel rather than a true per-tick candidate-pair count — the latter would
+  require passing a `TickProfile` into every tick (see `simulation.py`), which
+  itself calls `candidate_pairs()` an extra time, a real, avoidable cost this
+  phase does not add for a display-only figure.
+- No per-drone raw-position rendering — intentionally omitted; the heatmap
+  already proves movement without requesting/streaming raw positions by
+  default (an explicit non-goal).
+- UI verification in this session was limited to: the production build
+  (`npm run build`) succeeding, the Vite dev server serving the app and its
+  module graph correctly, and the full Vitest suite passing. Actual
+  browser-rendered visual behavior (canvas drawing, resize handling, live
+  interaction with a running simulation) was not manually verified in a
+  browser during this session — the pure coordinate/draw-command/reducer
+  logic that drives the canvas is unit tested, but that is not the same as
+  visually confirming the rendered result.
 
 ## Local debug viewer (prototype)
 
