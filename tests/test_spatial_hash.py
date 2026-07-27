@@ -93,3 +93,35 @@ def test_empty_and_single_drone_grids():
         grid = SpatialHashGrid(c)
         grid.build(state.positions, state.active_indices())
         assert grid.candidate_pairs().shape == (0, 2)
+
+
+def test_occupancy_stats_matches_manual_count():
+    c = cfg(400, world=20.0, near=2.0, seed=3)  # fairly dense -- some cells hold >1 drone
+    state = DroneState.generate(c)
+    grid = SpatialHashGrid(c)
+    grid.build(state.positions, state.active_indices())
+
+    coords = grid.cell_coords(state.positions[state.active_indices()])
+    keys = coords[:, 0] + coords[:, 1] * grid.nx + coords[:, 2] * (grid.nx * grid.ny)
+    _, counts = np.unique(keys, return_counts=True)
+
+    occupied_cells, mean_occupancy, max_occupancy = grid.occupancy_stats()
+    assert occupied_cells == counts.size
+    assert max_occupancy == int(counts.max())
+    assert mean_occupancy == pytest.approx(float(counts.mean()))
+    # Every drone belongs to exactly one occupied cell.
+    assert counts.sum() == state.active_indices().size
+
+
+def test_occupancy_stats_empty_grid_is_zeroed():
+    c = cfg(0)
+    state = DroneState.generate(c)
+    grid = SpatialHashGrid(c)
+    grid.build(state.positions, state.active_indices())
+    assert grid.occupancy_stats() == (0, 0.0, 0)
+
+
+def test_occupancy_stats_requires_build_first():
+    grid = SpatialHashGrid(cfg(10))
+    with pytest.raises(RuntimeError):
+        grid.occupancy_stats()

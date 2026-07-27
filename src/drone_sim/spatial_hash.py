@@ -111,6 +111,20 @@ class SpatialHashGrid:
         self._ucy = rem // self.nx
         self._ucx = rem % self.nx
 
+    # ----------------------------------------------------------- diagnostics
+    def occupancy_stats(self) -> tuple[int, float, int]:
+        """``(occupied_cells, mean_occupancy, max_occupancy)`` from the last
+        :meth:`build`. Cheap: reads the already-computed per-cell ``_counts``
+        array (one entry per *occupied* cell, not per drone or per total
+        cell), never rescans positions. For diagnostics/benchmarking only.
+        """
+        if not self._built:
+            raise RuntimeError("call build() before occupancy_stats()")
+        counts = self._counts
+        if counts is None or counts.size == 0:
+            return 0, 0.0, 0
+        return int(counts.size), float(counts.mean()), int(counts.max())
+
     # -------------------------------------------------------- candidate pairs
     def candidate_pairs(self) -> np.ndarray:
         """Return unique unordered candidate pairs as an (K, 2) int64 array.

@@ -95,6 +95,20 @@ class TickProfile:
     total_ns: int = 0
     context_stages_skipped: bool = False
 
+    #: Post-movement spatial-hash occupancy/pair/event counts for this tick
+    #: (see :meth:`~drone_sim.spatial_hash.SpatialHashGrid.occupancy_stats`).
+    #: Populated from the same post-movement grid/detection already built for
+    #: this tick -- no extra grid build or detection pass beyond what
+    #: profiling already does. Left at defaults (all zero) when ``profile``
+    #: is ``None``, same as every other field on this class.
+    occupied_cells: int = 0
+    mean_cell_occupancy: float = 0.0
+    max_cell_occupancy: int = 0
+    candidate_pair_count: int = 0
+    collision_pair_count: int = 0
+    near_miss_pair_count: int = 0
+    active_drone_count: int = 0
+
 
 class SimulationEngine:
     """Runs one ordered pipeline pass per tick over the world state.
@@ -200,6 +214,15 @@ class SimulationEngine:
             profile.post_pairs_ns = s9 - s8
             profile.detection_ns = s10 - s9
             profile.resolution_ns = s11 - s10
+
+            occupied_cells, mean_occ, max_occ = self.grid.occupancy_stats()
+            profile.occupied_cells = occupied_cells
+            profile.mean_cell_occupancy = mean_occ
+            profile.max_cell_occupancy = max_occ
+            profile.candidate_pair_count = int(post_pairs.shape[0])
+            profile.collision_pair_count = result.num_collisions
+            profile.near_miss_pair_count = result.num_near_misses
+            profile.active_drone_count = int(state.active_mask.sum())
 
         tick_time = time.perf_counter() - t0
         if profile is not None:

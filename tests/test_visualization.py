@@ -1,6 +1,14 @@
+import matplotlib
+
+matplotlib.use("Agg")  # headless: must be set before RemoteSimulationViewer's first pyplot import
+
 import numpy as np
 
-from drone_sim.visualization import compute_density_grid, collision_marker_positions
+from drone_sim.visualization import (
+    RemoteSimulationViewer,
+    compute_density_grid,
+    collision_marker_positions,
+)
 
 
 def test_density_grid_shape_and_bounds():
@@ -87,3 +95,50 @@ def test_collision_marker_positions_empty_pairs():
     markers = collision_marker_positions(positions, pairs)
 
     assert markers.shape == (0, 2)
+
+
+def _attached_remote_viewer(**kwargs):
+    """A RemoteSimulationViewer that never touches the network: attaching to
+    an existing simulation_id skips create_simulation/start_simulation."""
+    defaults = dict(viewport=(0.0, 100.0, 0.0, 100.0), x_bins=2, y_bins=2)
+    defaults.update(kwargs)
+    return RemoteSimulationViewer("http://example.invalid", simulation_id="test-sim", **defaults)
+
+
+def test_join_url_carries_viewport_so_browser_can_match_it():
+    viewer = _attached_remote_viewer(viewport=(1.0, 501.0, 2.0, 502.0))
+
+    url = viewer.join_url()
+
+    assert url.startswith("http://example.invalid/?")
+    assert "simulation_id=test-sim" in url
+    assert "x_min=1.0" in url
+    assert "x_max=501.0" in url
+    assert "y_min=2.0" in url
+    assert "y_max=502.0" in url
+
+
+def test_remote_viewer_shows_per_tick_marker_count_distinct_from_cumulative_total(monkeypatch):
+    # Reproduces the exact confusion this was built to fix: a viewer polling
+    # a shared simulation must show a per-tick count that's directly
+    # comparable to index.html's "collision markers: N" line, not just the
+    # ever-growing cumulative total (which looks wildly different from any
+    # single-tick number by design -- see runtime.py's RunningMetrics).
+    viewer = _attached_remote_viewer()
+    fake_frame = {
+        "status": "running",
+        "tick": 42,
+        "num_visible_drones": 10,
+        "heatmap": {"counts": [[0, 1], [2, 0]]},
+        "markers": [
+            {"x": 5.0, "y": 5.0}, {"x": 6.0, "y": 6.0}, {"x": 7.0, "y": 7.0},
+        ],
+        "metrics": {"total_collisions": 500, "total_near_misses": 900, "ticks_per_second": 12.0},
+    }
+    monkeypatch.setattr(viewer._api, "get_frame", lambda *a, **k: fake_frame)
+
+    viewer._poll_and_redraw()
+
+    text = viewer.metrics_text.get_text()
+    assert "collision markers: 3" in text
+    assert "collisions: 500" in text

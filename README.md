@@ -6,10 +6,20 @@ The project combines simulation, spatial indexing, collision detection, AI-based
 
 ## Project status
 
-**Current phase:** Phase 1 (local simulation kernel) and Phase 2 (AI and scenario control — batched movement policies, trajectory prediction, local collision avoidance, controlled rare-collision scenarios, collision-rate validation) are implemented and tested. Both are now also benchmarked, but **as two separate benchmarks measuring two different tick paths** — see below; do not read one benchmark's throughput as covering the other. A local Matplotlib debug viewer has also been added (see below). Online reinforcement learning, `NeuralAvoidanceMovementAlgorithm`, distributed workers, Redis, real-time streaming, and the production heatmap dashboard are later phases and are not part of this implementation.
+**Current phase:** Phase 3 — Visualization and APIs
+
+- Phase 1: Local simulation kernel — complete
+- Phase 2: Deterministic movement intelligence and scenario control — complete
+- Phase 3A: Snapshot, viewport-query API, and minimal browser visualization — complete
+
+Phase 1 (local simulation kernel) and Phase 2 (AI and scenario control — batched movement policies, trajectory prediction, local collision avoidance, controlled rare-collision scenarios, collision-rate validation) are implemented, tested, and unchanged by Phase 3A. Phase 3A (snapshot layer, background simulation runtime, vectorized viewport/heatmap/collision-marker queries, a small FastAPI app, and a minimal static browser page) is now also implemented and tested — see [Phase 3A: local visualization API](#phase-3a-local-visualization-api) below. A local Matplotlib debug viewer (a separate, Phase-1-era prototype, not part of Phase 3A) remains available too. Online reinforcement learning, `NeuralAvoidanceMovementAlgorithm` (evaluated and removed — see below), distributed workers, Redis, real-time streaming, and the production React/Canvas/WebGL dashboard are out of scope for this implementation.
+
+Four separate benchmarks measure four different workloads — do not read one's numbers as covering another:
 
 - `benchmarks/benchmark_simulation.py` measures the **Phase 1 tick path** (Random/Scripted policies, no `requires_context` policy registered — no pre-movement grid, prediction, or context construction). Its 100,000-drone, ~7.3 ticks/second result reflects *only* this path.
 - `benchmarks/benchmark_avoidance.py` measures the **full Phase 2 avoidance tick path** (`GoalDirectedMovementAlgorithm` vs. `LocalAvoidanceMovementAlgorithm`, including the pre-movement spatial hash, trajectory prediction, `MovementContext` construction, and the extra post-movement grid rebuild). It completes successfully at 100,000 drones for both policies — see [Phase 2 avoidance benchmark](#phase-2-avoidance-benchmark) below for measured throughput, the per-stage timing breakdown, and the dominant bottleneck.
+- `benchmarks/benchmark_visualization.py` measures **Phase 3A visualization-query cost** (snapshot creation, viewport filtering, heatmap generation, collision-marker queries, JSON-ready conversion) with simulation ticks explicitly excluded from every timed region — see [Phase 3A visualization-query benchmark](#phase-3a-visualization-query-benchmark) below.
+- `benchmarks/benchmark_viewer_comparison.py` measures **why an active browser session could run substantially slower than the Matplotlib viewer or the bounded pipeline-regression benchmark** — isolated vs. concurrent execution, a full configuration audit, and the orphaned-runtime-thread root cause — see [Browser vs. Matplotlib viewer: isolated-vs-concurrent investigation](#browser-vs-matplotlib-viewer-isolated-vs-concurrent-investigation) below.
 
 ## Getting started
 
@@ -29,7 +39,7 @@ pip install -e .
 python -m pytest -q
 ```
 
-This picks up `src/` and `tests/` automatically via `pyproject.toml`'s `pythonpath`/`testpaths` settings — no manual `PYTHONPATH` needed. 142 tests as of the Phase 2 avoidance benchmark (kernel, movement/trajectory/scenario/validation, the `TickProfile` profiling interface, the avoidance benchmark's setup helpers, and visualization-calculation tests).
+This picks up `src/` and `tests/` automatically via `pyproject.toml`'s `pythonpath`/`testpaths` settings — no manual `PYTHONPATH` needed. 218 tests as of the browser/Matplotlib viewer investigation (205 from Phase 1/2/3A and the tick-rate regression fix — see below — plus 13 more from this investigation: the `DELETE /simulations/{id}` endpoint stopping and removing a runtime, `/frame` no longer double-serializing its payload or making a second unmeasured lock acquisition, `SpatialHashGrid.occupancy_stats()`, and the `TickProfile` occupancy/pair-count fields). Of the 205: 142 from Phase 1/2; 50 from the initial Phase 3A build covering the snapshot layer, viewport/heatmap/collision-marker queries, the background runtime, and the FastAPI endpoints; 13 more from the tick-rate regression fix covering `RunningMetrics`, tick-timing isolation, lock fairness, and `/frame` snapshot reuse.
 
 **3. Run the benchmarks**
 
@@ -49,6 +59,15 @@ python benchmarks/benchmark_avoidance.py --sizes 1000 10000 --ticks 20 --seeds 1
 
 Runs the **full Phase 2 avoidance tick path** headlessly at 1,000 / 10,000 / 100,000 drones, comparing `GoalDirectedMovementAlgorithm` (no avoidance) against `LocalAvoidanceMovementAlgorithm` under identical starting positions, velocities, goals, and seeds. Reports the same kind of tick-latency/throughput table, plus a 10-stage timing breakdown (pre/post-movement spatial hash, trajectory prediction, context construction, movement, boundaries, detection, resolution) and an approximate tracked-array memory footprint. See [Phase 2 avoidance benchmark](#phase-2-avoidance-benchmark) below for results and the dominant bottleneck.
 
+```bash
+python benchmarks/benchmark_viewer_comparison.py
+# or customize:
+python benchmarks/benchmark_viewer_comparison.py --drones 10000 --seed 0 --duration 4.0
+python benchmarks/benchmark_viewer_comparison.py --scaling 1000 2000 5000 10000 25000
+```
+
+Runs the controlled comparison behind [Browser vs. Matplotlib viewer: isolated-vs-concurrent investigation](#browser-vs-matplotlib-viewer-isolated-vs-concurrent-investigation) below: a configuration audit, layered per-stage overhead (headless step -> Matplotlib data path -> runtime step -> runtime+snapshot -> runtime+snapshot+`/frame` polling), isolated-vs-simultaneous Matplotlib/browser-runtime process measurements, and (via `--demo {orphaned-threads,orphaned-contention,collision-markers,frame-serialization}`) four standalone, fast, in-process demonstrations of the specific root causes found.
+
 **4. Run the local debug viewer**
 
 ```bash
@@ -56,6 +75,15 @@ python scripts/run_visualizer.py --drones 10000 --render-every 5
 ```
 
 See [Local debug viewer](#local-debug-viewer-prototype) below for details and keyboard controls.
+
+**5. Run the Phase 3A API and browser visualization**
+
+```bash
+pip install -e ".[api]"
+uvicorn drone_sim.api.app:app --reload
+```
+
+Then open **http://127.0.0.1:8000/** in a browser. See [Phase 3A: local visualization API](#phase-3a-local-visualization-api) below for endpoint details, snapshot-consistency behavior, and known limitations.
 
 ## Goals
 
@@ -160,9 +188,9 @@ Movement algorithms are interchangeable policies applied in batches:
   no-avoidance comparison baseline for local avoidance.
 - `LocalAvoidanceMovementAlgorithm` — goal-directed movement plus a bounded
   correction away from the single most urgent predicted threat (Phase 2).
-- `NeuralAvoidanceMovementAlgorithm` — **planned, not implemented.** See
-  [Phase 2: AI and scenario control](#phase-2-ai-and-scenario-control) below
-  for why it comes after deterministic avoidance is proven correct.
+- `NeuralAvoidanceMovementAlgorithm` — **evaluated and removed, not currently
+  planned.** See [Phase 2: AI and scenario control](#phase-2-ai-and-scenario-control)
+  below for why.
 
 All policies operate on batches of drone state (never a per-drone Python
 loop) to remain practical at 100,000 drones.
@@ -253,22 +281,35 @@ drone-collision-simulator/
 - ~~Local collision avoidance~~
 - ~~Controlled rare-collision scenarios (`src/drone_sim/scenarios.py`)~~
 - ~~Collision-rate validation (`src/drone_sim/validation.py`)~~
-- ~~Online reinforcement learning and ~~`NeuralAvoidanceMovementAlgorithm` are
-  explicitly deferred — see [Phase 2]~~(#phase-2-ai-and-scenario-control) below.~~
+- Online reinforcement learning was never implemented.
 
-  Neural avoidance decision
+**Neural avoidance decision:** a neural-network avoidance policy was
+prototyped and evaluated, then removed from the project. It increased
+tick-processing cost without providing enough practical improvement over the
+deterministic local-avoidance policy. The deterministic policy remains the
+production movement strategy because it is faster, explainable,
+reproducible, and directly validated against controlled collision scenarios
+(see [Why neural training comes after deterministic validation](#why-neural-training-comes-after-deterministic-validation)).
+Neural avoidance is not currently planned.
 
-A neural-network avoidance policy was prototyped and evaluated but was removed from the project. It increased tick-processing cost without providing enough practical improvement over the deterministic local-avoidance policy.
+### Phase 3A: Snapshot, viewport-query API, and minimal browser visualization (complete)
 
-The deterministic policy remains the production movement strategy because it is faster, explainable, reproducible, and directly validated against controlled collision scenarios. Neural avoidance is not currently planned.
+- `SimulationSnapshot` — immutable, per-tick copy of what visualization needs
+  (`src/drone_sim/snapshot.py`)
+- `SimulationRuntime` — background-thread simulation controller, independent
+  of any API request (`src/drone_sim/runtime.py`)
+- Vectorized viewport queries (`src/drone_sim/viewport.py`), heatmap
+  generation (`src/drone_sim/heatmap.py`), and collision-marker queries
+  (`src/drone_sim/collision_queries.py`)
+- A small FastAPI app (`src/drone_sim/api/`) and a minimal static browser
+  page (`src/drone_sim/api/static/index.html`)
 
-### Phase 3: Visualization and APIs
+See [Phase 3A: local visualization API](#phase-3a-local-visualization-api) below for details, endpoints, and limitations.
 
-- Simulation control API
-- Viewport queries by bounding box and altitude range
-- Density heatmap tiles
-- Precise collision markers and details
-- Real-time state and metrics updates
+### Phase 3B and later: real-time streaming, production dashboard
+
+- Real-time state and metrics updates (WebSocket/SSE)
+- The React/Canvas/WebGL production dashboard
 
 ### Phase 4: Distributed execution
 
@@ -506,13 +547,16 @@ remains the correct ground-truth check for the specific injected pairs).
 
 ### Why neural training comes after deterministic validation
 
-`NeuralAvoidanceMovementAlgorithm` is **planned future work, not
-implemented**. Training or evaluating a learned avoidance policy requires a
+`NeuralAvoidanceMovementAlgorithm` was prototyped, evaluated, and **removed
+— it is not currently planned** (see the "Neural avoidance decision" note
+above). Training or evaluating a learned avoidance policy would require a
 trustworthy way to measure whether it actually reduces collision risk without
 just stopping drones or abandoning their goals — that measurement tool
 (`CollisionRateValidator`, exercised against known deterministic scenarios)
-is exactly what this phase built. Deterministic avoidance and its validation
-harness are the prerequisite, not a placeholder to route around.
+is exactly what this phase built, and it remains available if a future
+learned policy is ever reconsidered. Deterministic avoidance and its
+validation harness were the prerequisite for that evaluation, not a
+placeholder to route around.
 
 ### Phase 2 avoidance benchmark
 
@@ -581,6 +625,598 @@ available" on platforms where no stdlib-only method exists).
 
 Run it yourself: `python benchmarks/benchmark_avoidance.py`.
 
+## Phase 3A: local visualization API
+
+Phase 3A exposes the existing Phase 1/2 simulation kernel through a small,
+locally managed FastAPI backend and a minimal static browser page. It adds
+no new movement, avoidance, or collision logic — it only reads already
+-computed simulation state through a consistent snapshot.
+
+### Architecture
+
+```text
+Simulation runtime (background thread)
+    -> immutable SimulationSnapshot (one completed tick)
+    -> vectorized viewport / heatmap / collision-marker queries
+    -> FastAPI endpoints (Pydantic models)
+    -> minimal static browser page (heatmap canvas + collision markers)
+```
+
+New modules, none of which the simulation kernel depends on:
+
+| Module | Responsibility |
+| --- | --- |
+| `src/drone_sim/snapshot.py` | `SimulationSnapshot` + `build_snapshot()` — an immutable, per-tick copy of exactly what visualization needs (active drone ids/positions/velocities, collision/near-miss data, current metrics). Built from NumPy fancy-indexing, which already copies, so it never aliases mutable `DroneState` arrays. |
+| `src/drone_sim/runtime.py` | `SimulationRuntime` — advances a `Simulation` on a background `threading.Thread`. Supports start/pause/resume/step/reset/shutdown/status. A `threading.Lock` guards `_sim`/`_status`/`_snapshot`; it is held only while stepping the simulation and publishing the next snapshot, never during heatmap/JSON work. |
+| `src/drone_sim/viewport.py` | `ViewportQuery` + `find_visible_drones()` — vectorized inclusive bounding-box filtering (X/Y required, Z optional) over a snapshot. |
+| `src/drone_sim/heatmap.py` | `HeatmapQuery` + `compute_heatmap()` — `numpy.histogram2d` over the visible drones in a viewport, with independently configurable X/Y bin counts and a hard per-axis bin cap. |
+| `src/drone_sim/collision_queries.py` | `CollisionMarker` + `query_collision_markers()` — reads the snapshot's already-classified collision pairs and returns per-pair markers (midpoint position, distance, relative speed), optionally filtered to a viewport. |
+| `src/drone_sim/api/` | FastAPI app (`app.py`), Pydantic request/response models (`models.py`), route handlers (`routes.py`), and the static browser page (`static/index.html`). The only place in the codebase that imports FastAPI/Pydantic — the simulation kernel has no such dependency. |
+
+`SimulationRuntime` also keeps a `RunningMetrics` accumulator (O(1) per tick,
+bounded memory) instead of calling `MetricsCollector.summary()` every tick —
+see [Phase 3A tick-rate regression](#phase-3a-tick-rate-regression) below for
+why that distinction matters.
+
+### Simulation tick rate vs. visualization refresh rate
+
+These are two different, independently-measured rates and the API keeps them
+clearly separated:
+
+- **Simulation tick rate** — how fast the background thread calls
+  `Simulation.step()`. Reported as `mean_tick_ms` / `ticks_per_second` in
+  `snapshot.metrics`, computed by `RunningMetrics` from `TickMetrics.tick_time_s`
+  values that `Simulation.step()` records **before** any scheduler sleep or
+  visualization work happens — see [timing metric definitions](#timing-metric-definitions).
+- **Visualization refresh rate** — how often the browser page polls
+  `/simulations/{id}/frame` (control-plane, HTTP-request-driven, currently
+  ~150ms / ~6.7 Hz, see [Browser polling](#browser-polling-behavior) below).
+  A refresh never advances the simulation; it only reads whatever snapshot the
+  background thread has already published.
+
+The two are independent by design: the simulation can tick much faster (or,
+under load, slower) than the browser happens to refresh, and a slow browser
+tab never throttles the simulation.
+
+### Snapshot-consistency behavior
+
+The API never reads `Simulation`/`DroneState` arrays directly. `SimulationRuntime`
+publishes a new `SimulationSnapshot` only after a tick fully completes (movement,
+boundaries, detection, resolution, metrics), under its lock. Every field on one
+snapshot — positions, collision pairs, metrics — belongs to that same tick.
+Request handlers call `get_snapshot()` (a cheap, lock-protected reference read)
+and then run viewport/heatmap/collision queries against that already-published,
+immutable object outside any lock, so expensive JSON/heatmap work never blocks
+the background tick loop. Every viewport/heatmap/collision/metrics response
+includes `tick`, so a client polling repeatedly can tell whether two responses
+came from the same tick or different ones.
+
+### Endpoints
+
+```text
+POST /simulations                          create a simulation, returns simulation_id
+GET  /simulations/{id}                      status (created/running/paused/stopped), current tick
+POST /simulations/{id}/start                start the background tick loop
+POST /simulations/{id}/pause
+POST /simulations/{id}/resume
+POST /simulations/{id}/step                 advance exactly one tick (must not be running)
+POST /simulations/{id}/reset                recreate from the original config/seed
+
+GET  /simulations/{id}/viewport?x_min=&x_max=&y_min=&y_max=&z_min=&z_max=&limit=
+GET  /simulations/{id}/heatmap?x_min=&x_max=&y_min=&y_max=&x_bins=&y_bins=
+GET  /simulations/{id}/collisions[?x_min=&x_max=&y_min=&y_max=&z_min=&z_max=]
+GET  /simulations/{id}/metrics
+GET  /simulations/{id}/frame?x_min=&x_max=&y_min=&y_max=&z_min=&z_max=&x_bins=&y_bins=
+```
+
+`/frame` combines heatmap + collision markers + metrics + status + timing
+measurements from **one** `get_snapshot()` call, so every field in the
+response describes the same tick. It is what the browser page polls — see
+[Phase 3A tick-rate regression](#phase-3a-tick-rate-regression) for why this
+replaced four separate per-refresh requests. It never returns raw drone
+positions (use `/viewport` explicitly for those, subject to the same
+`MAX_VISIBLE_DRONES` cap described below).
+
+Unknown `simulation_id` → `404`. Reversed/invalid bounds or an out-of-range
+bin count → `400`. Missing required query parameters → `422` (FastAPI's own
+validation). Calling `start`/`pause`/`resume`/`step`/`reset` in a state that
+doesn't allow it (e.g. `step` while running) → `409`.
+
+### Raw-drone result limits
+
+A viewport response never returns all 100,000 raw drone positions by
+default. `MAX_VISIBLE_DRONES` (5,000, in `src/drone_sim/api/routes.py`) caps
+the `limit` query parameter; requesting more is rejected with `422`. When a
+viewport's true visible count exceeds the requested `limit`, the response
+**omits the excess positions** and reports `truncated: true` plus the real
+`total_visible` count — it does not silently drop them without saying so.
+Heatmap and collision-marker responses are unaffected by this cap since they
+already return aggregated/bounded data, not one row per drone.
+
+### How heatmap bins are calculated
+
+`compute_heatmap()` filters to the requested viewport via `find_visible_drones()`,
+then calls `numpy.histogram2d(x, y, bins=[x_bins, y_bins], range=[x_range, y_range])`
+with `x_range`/`y_range` set to the viewport bounds — no per-drone Python
+loop. `sum(counts) == num_drones_included` for any non-empty viewport. An
+empty viewport (or one with no drones) returns an all-zero grid with edges
+still spanning the requested bounds, rather than an error.
+
+### How collision marker positions are determined
+
+`query_collision_markers()` reads `SimulationSnapshot.collision_pairs`/
+`collision_distances` as already computed by `CollisionDetectionEngine` —
+it never reclassifies or recomputes a collision. Marker position is the
+midpoint between the two drones' captured positions; distance and relative
+speed come directly from the snapshot's stored collision distance and the
+two drones' captured velocities. Since `SpatialHashGrid.candidate_pairs()`
+already guarantees each unordered pair appears at most once, no
+reversed-duplicate filtering is needed.
+
+### Phase 3A tick-rate regression
+
+**Symptom:** the Matplotlib debug viewer ran at ~10.23 ms/tick (~97.8
+ticks/sec) at 10,000 drones, while the Phase 3A browser viewer reported
+~66.78 ms/tick (~14.97 ticks/sec) at the same drone count.
+
+**Movement policy — ruled out first.** `create_simulation()`
+(`src/drone_sim/api/routes.py`) never sets `goal_positions` or a custom
+`MovementSystem`, and `DroneState.generate()` always assigns
+`movement_policy_ids = 0` (`RandomMovementAlgorithm`'s id). `scripts/run_visualizer.py`
+does the same. **Both viewers run the identical `RandomMovementAlgorithm`,
+with `requires_context=False` in both** — no `GoalDirectedMovementAlgorithm`/
+`LocalAvoidanceMovementAlgorithm` mismatch, no context-aware avoidance path
+active anywhere in either viewer. World size, `dt`, `collision_radius`,
+`near_miss_radius`, and `boundary_mode` all use the same defaults in both
+code paths as well. This hypothesis was checked and is not the cause —
+`benchmarks/benchmark_pipeline_regression.py`'s Section 1 output states this
+explicitly on every run.
+
+**Root cause 1 — `build_snapshot()` recomputed metrics from the entire tick
+history, every tick.** `SimulationViewer._advance()` (the Matplotlib path)
+reads `sim.metrics.ticks[-1]` — O(1), just the tick that was just recorded.
+The old `build_snapshot()` instead called `sim.metrics.summary()`
+unconditionally on every tick. `MetricsCollector.summary()` rebuilds NumPy
+arrays from **every** `TickMetrics` ever recorded and sorts them for
+percentiles — an O(ticks-so-far) cost, called every tick, inside the
+runtime's lock. Measured directly (`benchmark_pipeline_regression.py`
+Section 2, real `MetricsCollector`/`RunningMetrics` objects, synthetic
+history so the measurement itself stays bounded):
+
+| History (ticks) | `MetricsCollector.summary()` — OLD (ms/call) | `RunningMetrics.summary()` — NEW (ms/call) |
+| ---: | ---: | ---: |
+| 100 | 0.20 | 0.13 |
+| 1,000 | 0.41 | 0.13 |
+| 5,000 | 1.31 | 0.13 |
+| 20,000 | 3.39 | 0.07 |
+| 50,000 | 8.26 | 0.06 |
+
+This cost is paid **in addition to** the real simulation tick cost, on every
+tick, and grows without bound the longer a browser session runs — exactly
+the kind of session-length-dependent degradation that would produce a much
+worse number after several minutes of continuous polling than at the start
+of a session, and that a short bounded benchmark run cannot itself reproduce
+at full scale (which is why it's measured here as a pure function of history
+length instead). The Matplotlib viewer never pays this cost at all.
+
+**Fix:** `RunningMetrics` (`src/drone_sim/runtime.py`) replaces the
+per-tick `summary()` call. It updates O(1) running totals (`num_ticks`,
+`total_time_s`, `total_collisions`, `total_near_misses`,
+`total_candidate_pairs`, running min/max) from `sim.metrics.ticks[-1]`, and
+keeps only the most recent `RECENT_WINDOW` (200) tick times in a bounded
+`collections.deque` for the `median_tick_ms`/`p95_tick_ms` display fields —
+an intentional, documented approximation (exact for every other field).
+`build_snapshot()` (`src/drone_sim/snapshot.py`) now takes `metrics` as a
+parameter instead of computing it, so it cannot silently regress back to an
+expensive call.
+
+**Root cause 2 — the unthrottled background loop starved API readers of the
+lock.** `SimulationRuntime`'s default (`tick_interval_s=0`, used by
+`POST /start`) is a tight loop: acquire lock → step → release → immediately
+try to acquire again. Measured (`benchmark_pipeline_regression.py` Section 3,
+10,000 drones, a reader thread calling `get_snapshot()` every 20ms against
+the running background loop):
+
+| | mean lock-wait (ms) | max lock-wait (ms) | throughput (ticks/sec) |
+| --- | ---: | ---: | ---: |
+| OLD (no yield) | 259.9 | 950.0 | 73 |
+| NEW (`BUSY_LOOP_YIELD_S`) | 7.2 | 14.4 | 78 |
+
+Without a yield, an API request's `get_snapshot()` call could block for
+**close to a full second** waiting for the lock, at essentially no
+throughput benefit (`time.sleep(0)` alone was tried first and was not
+reliably enough — Windows' scheduler quantum is coarser than a bare yield).
+**Fix:** a small real sleep, `BUSY_LOOP_YIELD_S = 0.0005` (0.5 ms), inserted
+between ticks whenever `tick_interval_s <= 0` (`src/drone_sim/runtime.py`).
+Its throughput cost is a fixed ~0.5 ms/tick — negligible at the 1k-100k
+drone scale this project targets (multi-millisecond ticks) but
+proportionally larger for very small/fast simulations; see Known
+limitations below.
+
+**Structural checks (verified, not bugs):** heatmap/collision-marker/JSON
+work happens strictly after `get_snapshot()` returns, outside the lock
+(`routes.py`); `start()` already rejected a second concurrent loop
+(`thread.is_alive()` check); no endpoint calls `step_once()` or otherwise
+advances the simulation; each old endpoint already read one cached snapshot
+reference rather than rebuilding one. Two things were nonetheless tightened:
+the browser page previously made 4 separate requests per refresh (now 1, via
+`/frame`) with no guard against overlapping in-flight requests (now guarded,
+see below) — this didn't create a new full snapshot per request (snapshots
+were already reused), but it was unnecessary request/lock-acquisition
+overhead and a real risk of pile-up if a request ever ran long.
+
+### Timing metric definitions
+
+All timings are in milliseconds and returned in `/frame`'s `timings` object
+(also individually available: `SimulationRuntime.get_last_timings()`,
+`get_snapshot_with_lock_wait()`).
+
+| Field | Measures | Excludes |
+| --- | --- | --- |
+| `sim_step_ms` | `Simulation.step()` alone (movement, boundaries, spatial hash, detection, resolution, metrics recording) | snapshot build, queries, serialization, scheduler sleep |
+| `snapshot_build_ms` | `build_snapshot()` alone (array copies + O(1) `RunningMetrics.summary()`) | everything above |
+| `lock_wait_ms` | time an API request spent waiting to acquire the runtime lock in `get_snapshot()` | — |
+| `heatmap_ms` | `compute_heatmap()` alone | — |
+| `collisions_ms` | `query_collision_markers()` alone | — |
+| `serialization_ms` | `json.dumps()` of the heatmap+markers+metrics payload | the browser's own `fetch`/render time |
+| `total_request_ms` | full `/frame` handler, start to finish | browser-side network/render time |
+| `mean_tick_ms` / `ticks_per_second` (in `metrics`) | `RunningMetrics` running average over `TickMetrics.tick_time_s` (same source as `sim_step_ms`) | scheduler sleep (`tick_interval_s`), since `tick_time_s` is recorded inside `Simulation.step()`, before the loop's own `time.sleep()` call |
+
+### Snapshot publication behavior (unchanged)
+
+`SimulationRuntime` still publishes exactly one new `SimulationSnapshot` per
+completed tick, under its lock, with every field belonging to that same tick
+— this fix did not change snapshot consistency semantics, only what
+`build_snapshot()` is given for `metrics` and how quickly the lock is
+released back to waiting readers.
+
+### Browser polling behavior
+
+The static page polls `GET /simulations/{id}/frame` every
+`REFRESH_INTERVAL_MS = 150` (~6.7 Hz, within the 5-10 Hz target) instead of
+the previous 4 separate requests every 500ms. A `requestInFlight` guard skips
+starting a new poll if the previous `/frame` request hasn't returned yet, so
+a slow request is never compounded by an overlapping second one.
+`createSimulation()` also stops whatever simulation this browser tab (or a
+previous load of it, tracked via `sessionStorage`) was last pointed at before
+creating a new one — see [Orphaned runtime threads](#orphaned-runtime-threads-root-cause)
+below for why that step exists.
+
+## Browser vs. Matplotlib viewer: isolated-vs-concurrent investigation
+
+A live browser session was observed running substantially slower than the
+Matplotlib debug viewer at 10,000 drones (~28-39 ms/tick and ~35 ticks/sec in
+the browser vs. ~10 ms/tick and ~99 ticks/sec in Matplotlib, with both open
+at once), even though `benchmark_pipeline_regression.py` had measured the
+browser's full per-tick pipeline at ~12.5 ms/tick in isolation (see
+[Phase 3A tick-rate regression](#phase-3a-tick-rate-regression) above). This
+section documents the controlled investigation into why, using
+`benchmarks/benchmark_viewer_comparison.py`. Two real, structural bugs were
+found and fixed; a third suspected cause (world-density difference) was
+checked and is not a meaningful factor.
+
+### Root cause: orphaned runtime threads
+
+**This is the dominant, measured cause.** Before this fix, there was no way
+to stop a `SimulationRuntime` short of process exit or the test-only
+`reset_registry()` (which wipes every simulation at once). Every
+`POST /simulations` call (made once on page load by `index.html`'s `init()`,
+and again on every "Apply / New simulation" click) created a brand new
+`SimulationRuntime` — with its own real background `threading.Thread` calling
+`Simulation.step()` in a tight loop (`BUSY_LOOP_YIELD_S = 0.0005` between
+ticks) — and nothing ever called `shutdown()` on the previous one. A page
+reload or an extra "Apply" click did not replace the old simulation; it added
+another one, forever, silently consuming CPU that the currently-viewed
+simulation's background thread had to share the same GIL with.
+
+Measured directly (`--demo orphaned-contention`, 10,000 drones, the browser's
+default world, one "primary" runtime plus N forgotten sibling runtimes all
+started in the same process, each sibling's thread otherwise identical to
+what a pre-fix reload/Apply-click would have left running):
+
+| orphaned siblings | primary ms/tick | slowdown vs. 0 siblings |
+| ---: | ---: | ---: |
+| 0 | 10.75 | 1.00x |
+| 1 | 15.27 | 1.42x |
+| 2 | 19.32 | 1.80x |
+| 3 | 25.64 | 2.38x |
+
+The degradation is roughly linear in sibling count and already reaches the
+observed 28-39 ms/tick range by 3-5 accumulated orphans — well within what a
+few page reloads or "Apply" clicks during a debugging session would leave
+behind pre-fix. `--demo orphaned-threads` confirms the mechanism directly at
+the thread-count level rather than through timing: simulating 5 reloads with
+the old "create, never stop" behavior leaves 5 extra live threads; simulating
+the same 5 reloads with the fix (delete the previous simulation before
+creating the next one) leaves exactly 1.
+
+**Fix:**
+- `DELETE /simulations/{id}` (`src/drone_sim/api/routes.py`) — new endpoint;
+  calls `runtime.shutdown()` and removes it from the registry. This is the
+  server-side capability that made stopping a runtime possible at all outside
+  tests.
+- `index.html`'s `createSimulation()` now calls this on the previous
+  `simulationId` before creating a new one. The id is also persisted to
+  `sessionStorage` so a page **reload** (which loses the in-memory
+  `state.simulationId` from the previous page load) can still clean up the
+  previous simulation instead of orphaning it.
+- **Known limitation:** a closed tab that is never reloaded or revisited in
+  the same browser session leaves its simulation running until the server
+  process exits — there is no server-side idle timeout or heartbeat, since
+  that would be new infrastructure beyond what this bug required. Multiple
+  simulations *concurrently* is not itself a bug (Phase 3A's registry
+  supports many `simulation_id`s by design); the bug was that nothing could
+  ever stop one.
+
+### Secondary fix: `/frame`'s double JSON serialization and second lock acquisition
+
+`get_frame()` (`src/drone_sim/api/routes.py`) called `json.dumps(payload)`
+once into a variable used only to measure `serialization_ms` and then
+**discarded**, then called it **again** (with a `timings` key added) to build
+the actual response body — the full heatmap/markers/metrics payload was
+serialized twice per request, one of which did nothing. Separately, it called
+`runtime.get_snapshot_with_lock_wait()` (measured as `lock_wait_ms`) and then
+`runtime.get_status()` — a **second, completely unmeasured** lock
+acquisition, which could itself block for as long as the background loop was
+mid-tick. Both of these ran *after* `total_request_ms` was already computed,
+so neither showed up anywhere in the reported timings — exactly the gap
+between `lock_wait_ms + heatmap_ms + collisions_ms + serialization_ms` and
+`total_request_ms` (7.777 + 3.191 + 0.421 + 0.183 = 11.572 ms reported vs.
+48.448 ms total in one observed session).
+
+**Fix:**
+- `SimulationRuntime.get_snapshot_and_status_with_lock_wait()`
+  (`src/drone_sim/runtime.py`) reads the snapshot and status from one lock
+  acquisition instead of two — also fixing a latent consistency gap where the
+  returned status/tick could, in principle, describe a *later* tick than the
+  snapshot if the background loop advanced between the two old calls.
+- `get_frame()` now calls `json.dumps()` exactly once on the full payload.
+  `serialization_ms`/`total_request_ms` describe the cost of producing a
+  payload that cannot yet contain its own value, so they are computed from
+  that one dump and spliced into the already-serialized JSON text as a
+  second, tiny (~7-float) dump + string concatenation, rather than
+  re-dumping the whole payload again.
+
+Measured (`--demo frame-serialization`, 10,000 drones, a real `/frame`
+payload shape — 60x60 heatmap + collision markers — replayed 200 times):
+
+| pattern | ms/call |
+| --- | ---: |
+| OLD (two full `json.dumps()` calls, one discarded) | 0.337 |
+| NEW (one full dump + tiny splice) | 0.170 |
+
+~2x less JSON-serialization work per request, and — more importantly — the
+timing gap is closed: `test_frame_timings_sum_does_not_exceed_total_request`
+(`tests/test_api.py`) now holds, which it could not have before this fix.
+
+In-process, this fix's effect on the background tick thread itself (GIL
+contention from a concurrent `/frame`-polling thread, measured with
+`--duration`-second runs of `runtime.start()` with vs. without a concurrent
+poller hitting the real, post-fix `get_frame()` at ~6.7 Hz) was small on the
+24-logical-core development machine used here: ~10.7 ms/tick with no
+polling vs. ~10.9-11.9 ms/tick with polling (0.96-1.1x) across repeated runs
+— within normal run-to-run noise. This does not rule out larger in-process
+GIL contention on a machine with fewer cores; it says the *post-fix* cost of
+one poller is small on this machine, which is a different (also useful)
+claim from "GIL contention never matters here."
+
+### Configuration audit: browser default world vs. Matplotlib world
+
+Printed by `benchmark_viewer_comparison.py`'s config-audit section (also
+reproduced here for 10,000 drones, both using `collision_radius=1.0`,
+`near_miss_radius=2.0`, `cell_size=2.0`, `dt=1.0`, `RandomMovementAlgorithm`,
+confirmed identical in both by reading `state.py`/`routes.py`/
+`run_visualizer.py`, not assumed):
+
+| | Matplotlib (`run_visualizer.py`) | Browser, unmodified default UI fields |
+| --- | --- | --- |
+| world bounds | (0,0,0)..(172.35, 172.35, 172.35) | (0,0,0)..(500, 500, 100) |
+| world volume | 5,120,000 | 25,000,000 |
+| grid dims | 87 x 87 x 87 | 250 x 250 x 50 |
+| total cells | 658,503 | 3,125,000 |
+| cells/drone | 65.85 | 312.50 |
+
+The browser's default world (driven by the UI's unmodified `x_min/x_max/
+y_min/y_max` fields — see below) is **4.75x sparser** (more cells per drone),
+not denser, than the Matplotlib viewer's `world_side_for()`-scaled world —
+the opposite of the "browser world is a denser box" hypothesis one might
+reach without checking. Measured directly across the scaling benchmark (mean
+cell occupancy stayed at 1.000-1.003 drones/occupied-cell from 1,000 to
+25,000 drones in the browser's world — i.e., candidate-pair generation's
+dominant cost, which scales with *occupied-cell count* and is bounded below
+by `min(num_drones, total_cells)`, is essentially unaffected by this
+density difference here since both worlds have far more cells than drones).
+**Verdict: the world-density difference is real but not a meaningful
+contributor to the observed slowdown** — the orphaned-runtime-thread bug
+above is.
+
+**Viewport bounds are not world bounds, and this UI conflates them.**
+Verified by reading `index.html` + `routes.py` + `models.py`: the same
+`x_min/x_max/y_min/y_max` UI fields are used for two different things —
+(1) at simulation-**creation** time, `width = x_max - x_min` and
+`height = y_max - y_min` become `bounds_max[0:2]` for the new
+`SimulationConfig` (`z` is hardcoded to `100` client-side and never sent to
+`POST /simulations` at all — the `z_min`/`z_max` UI fields only ever affect
+(2) below); (2) on every `/frame` poll, the *same* field values are sent as
+the queried viewport's bounds. With the fields left at their defaults these
+numerically coincide, so no viewport truncation happens by default — this is
+**not** why the browser showed fewer collision markers (see next section).
+But editing the bounds fields after a simulation already exists changes only
+the *queried viewport*; the world itself stays whatever it was at creation.
+
+### Collision-marker semantics: "7" vs. "hundreds" is a display-window difference, not a detection difference
+
+`query_collision_markers()` (`src/drone_sim/collision_queries.py`), used by
+both `/collisions` and `/frame`, only ever reads `SimulationSnapshot.collision_pairs`
+— the collisions found on the **single most recently completed tick**.
+`SimulationViewer._redraw()` (`src/drone_sim/visualization.py`), by contrast,
+plots `IntervalStats.all_collision_pairs` — the **union of every tick's**
+`collision_pairs` **since the last redraw** (`render_every` ticks, 5 by
+default), reset only when a redraw happens. Both read from the exact same
+kind of `DetectionResult`; nothing about detection, thresholds, or world
+density differs between them for this purpose.
+
+Measured directly (`--demo collision-markers`, one simulation, 50 ticks,
+`render_every=5`, both interpretations computed from the identical tick
+sequence so this isolates the display-window semantics alone): single-tick
+counts ranged 1-12 (what `/frame` would show on any given poll); the
+5-tick-accumulated count at each of the 10 redraws ranged 30-50 (what
+Matplotlib would show at that redraw). Both sum to the same total (395) across
+the full run — it is the same underlying collisions, grouped differently for
+display. This fully explains a browser poll showing a handful of markers
+while Matplotlib's redraw shows dozens to hundreds, without needing any
+config or detection difference.
+
+### Runtime-thread / process findings
+
+- Exactly one `SimulationRuntime` (and one background thread) should exist
+  per simulation actually in use; the registry (`_runtimes` in `routes.py`)
+  intentionally supports many concurrently (Phase 3A scope), but nothing
+  should be *forgotten* — `DELETE` now makes that possible to guarantee
+  client-side.
+- `reset()` does not create a duplicate thread (verified by reading
+  `runtime.py`: it swaps `self._sim` under the existing lock and never
+  touches `self._thread`) — this was already correct, not a bug.
+- `uvicorn drone_sim.api.app:app --reload` runs a lightweight file-watching
+  parent process plus one worker process; it does not start multiple workers
+  or duplicate the app's in-process `_runtimes` registry. Use
+  `uvicorn drone_sim.api.app:app` (no `--reload`) for anything resembling a
+  performance measurement — `--reload`'s file-watcher is unrelated overhead
+  during development, not a correctness issue.
+- Real multi-process CPU contention (`benchmark_viewer_comparison.py`'s
+  process-level cases 6/7/8: Matplotlib and the browser runtime as two
+  separate OS processes, isolated then simultaneous) was small on the
+  24-logical-core development machine used here (Matplotlib 1.0x-1.05x,
+  runtime 1.0x-1.03x slower when run together vs. alone, across repeated
+  runs) — expected, since 24 cores comfortably fit two mostly-single-threaded
+  Python processes. Machines with fewer cores should expect more contention
+  from this specific mechanism; it was not the dominant effect measured here.
+- `OMP_NUM_THREADS`/`MKL_NUM_THREADS`/`OPENBLAS_NUM_THREADS`/`NUMEXPR_NUM_THREADS`
+  were unset (NumPy/BLAS defaults) during these measurements — reported by
+  the benchmark script as a known, real class of thread-oversubscription
+  confound for anyone re-running this on a different machine, not something
+  this fix changes.
+
+### Full `/frame` request timing: what each field measures and what is excluded
+
+| Field | Measures | Excludes |
+| --- | --- | --- |
+| `sim_step_ms` | `Simulation.step()` alone | snapshot, queries, serialization |
+| `snapshot_build_ms` | `build_snapshot()` alone | everything above |
+| `lock_wait_ms` | the request's *one* wait to acquire the runtime lock (`get_snapshot_and_status_with_lock_wait()`) | — |
+| `heatmap_ms` | `compute_heatmap()` alone | — |
+| `collisions_ms` | `query_collision_markers()` alone | — |
+| `serialization_ms` | the one real `json.dumps()` of the full payload | the tiny follow-up dump that splices in the timings block itself (microseconds) |
+| `total_request_ms` | from handler entry to the moment the response body is fully serialized | ASGI dispatch/queueing before the handler starts, Starlette's response-object wrapping, the socket write, and the browser's own network/render time |
+
+The last row's exclusions are structural, not an oversight: a synchronous
+FastAPI route handler (this one is `def`, not `async def`) has no visibility
+into time spent before it starts running (Starlette dispatches it via a
+thread-pool executor) or after it returns (ASGI response transmission,
+Uvicorn's socket write). Measuring those would require instrumenting
+Starlette/Uvicorn internals, which is out of this project's scope; they are
+documented here as excluded rather than silently absent.
+
+### Running the tests and benchmark
+
+```bash
+pip install -e ".[dev,api]"
+python -m pytest -q tests/test_snapshot.py tests/test_viewport.py tests/test_heatmap.py \
+    tests/test_collision_queries.py tests/test_runtime.py tests/test_runtime_timing.py tests/test_api.py
+# or just: python -m pytest -q   (runs everything, Phase 1/2/3A together)
+
+python benchmarks/benchmark_visualization.py
+# or customize:
+python benchmarks/benchmark_visualization.py --sizes 1000 10000 100000 --repeats 5
+
+python benchmarks/benchmark_pipeline_regression.py
+# or customize:
+python benchmarks/benchmark_pipeline_regression.py --drones 10000 --ticks 300
+```
+
+### Phase 3A visualization-query benchmark
+
+Measures snapshot creation, viewport filtering, heatmap generation,
+collision-marker queries, and JSON-ready response conversion, each timed
+**separately** and with `Simulation.step()` ticks excluded from every timed
+region (a different workload than `benchmark_simulation.py`/
+`benchmark_avoidance.py`, never combined with their numbers). Measured with
+`python benchmarks/benchmark_visualization.py --sizes 1000 10000 100000 --repeats 5`
+on this development machine (5 repeats per stage, after 3 warmup ticks,
+mean ± std, milliseconds):
+
+| Drones | Snapshot | Viewport | Heatmap | Collisions | JSON conversion |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 0.18 ± 0.06 | 0.03 ± 0.02 | 0.19 ± 0.06 | 0.04 ± 0.01 | 0.75 ± 0.05 |
+| 10,000 | 0.40 ± 0.03 | 0.14 ± 0.05 | 0.44 ± 0.04 | 0.08 ± 0.01 | 4.46 ± 0.16 |
+| 100,000 | 2.65 ± 0.17 | 0.54 ± 0.04 | 3.23 ± 0.28 | 0.36 ± 0.03 | 8.38 ± 0.16 |
+
+All figures are from one local run and will vary by machine; re-run the
+benchmark yourself rather than treating these as guarantees. At every scale
+tested, JSON conversion of the viewport+heatmap+markers payload dominates
+total visualization-query cost, not the NumPy-side queries themselves — this
+was not optimized further since nothing here identified a real problem
+(only a correctness-scoped viewport sample of up to 5,000 drones plus a
+100×100 heatmap grid were serialized in this benchmark).
+
+### Phase 3A pipeline-stage benchmark (tick-rate regression)
+
+Measured with `python benchmarks/benchmark_pipeline_regression.py --drones 10000 --ticks 150 --warmup 10`
+on this development machine (Section 1 output; RandomMovementAlgorithm,
+`requires_context=False`, confirmed identical to the Matplotlib viewer's
+policy — see [Phase 3A tick-rate regression](#phase-3a-tick-rate-regression)
+above for the full diagnosis and Sections 2/3's before/after numbers):
+
+| Stage | Mean ms/tick |
+| --- | ---: |
+| (a) Matplotlib-equivalent: `sim.step()` only | 10.245 |
+| (b) + snapshot publication (fixed `RunningMetrics`) | 11.020 |
+| &nbsp;&nbsp;— `sim_step` component | 10.686 |
+| &nbsp;&nbsp;— `snapshot_build` component | 0.334 |
+| (c) + viewport/heatmap/collision-marker queries | 1.229 |
+| (c) + JSON serialization | 0.205 |
+| **(c) full per-tick pipeline total** | **12.455** |
+
+With the fix, the full per-tick pipeline (simulation + snapshot + queries +
+serialization, no HTTP) costs ~12.5ms — close to the Matplotlib viewer's
+~10.2ms baseline, not the reported ~66.8ms. That confirms the ~66.8ms figure
+was not explained by fixed per-tick pipeline overhead (Section 1 alone) —
+it required the session-length-dependent effects in Sections 2 and 3 (the
+O(history) metrics cost and lock starvation, both fixed above) compounding
+over a longer-running session than this bounded benchmark reproduces at
+full scale.
+
+### Known limitations
+
+- Single locally managed simulation per `simulation_id`, all held in an
+  in-process dict (`src/drone_sim/api/routes.py`) — no persistence, no
+  multi-process/multi-tenant orchestration. This is intentional Phase 3A
+  scope, not an oversight. `DELETE /simulations/{id}` (added by the
+  investigation in [Browser vs. Matplotlib viewer](#browser-vs-matplotlib-viewer-isolated-vs-concurrent-investigation)
+  above) lets a client stop and remove one; nothing sweeps up a simulation
+  whose tab was closed and never reloaded/revisited, since that would need a
+  server-side idle timeout this bug did not require.
+- Near-miss data is captured in `SimulationSnapshot` (per the phase's
+  optional-data allowance) but is **not** exposed through any Phase 3A
+  endpoint or the browser page, to keep the API surface to what the
+  acceptance criteria require.
+- The static browser page is a functional proof the API works, not a
+  polished UI: no styling beyond basic layout, a fixed-size canvas, and a
+  ~150ms poll loop (with an overlap guard) rather than push/streaming
+  updates (streaming is explicitly Phase 3B+ scope).
+- `/simulations/{id}/step` and `/simulations/{id}/reset` require the
+  simulation not be actively running (`409` otherwise) — pause first.
+- `RunningMetrics.median_tick_ms`/`p95_tick_ms` are computed from only the
+  most recent 200 ticks (`RECENT_WINDOW`), not the full session history —
+  an intentional, bounded approximation (see [Phase 3A tick-rate regression](#phase-3a-tick-rate-regression)).
+  `mean_tick_ms`, `ticks_per_second`, and all totals remain exact.
+- `BUSY_LOOP_YIELD_S` (0.5ms, inserted between ticks when unthrottled) costs
+  a fixed ~0.5ms/tick of throughput to keep API-reader lock-wait bounded.
+  Negligible at the 1k-100k drone scale this project targets, but
+  proportionally larger for a very small/fast simulation (e.g. a few
+  hundred drones with sub-millisecond ticks) — measured trade-off, not
+  something the code auto-tunes.
+
 ## Local debug viewer (prototype)
 
 A minimal Matplotlib-based viewer lets you watch the Phase 1 kernel run from a
@@ -623,6 +1259,77 @@ Keyboard controls (shown at the bottom of the window):
 The metrics panel distinguishes current-interval values (since the last
 redraw) from cumulative values (since the simulation started or was last
 reset).
+
+### Remote mode: same data as the browser page
+
+`--remote` switches the viewer from owning a local `Simulation` to polling a
+running `uvicorn drone_sim.api.app:app` server instead, via
+`src/drone_sim/api_client.py` (stdlib `urllib`, no FastAPI import -- see that
+module's docstring on why the kernel/viz side stays decoupled from whatever
+HTTP library the API side uses). This is the same role
+`drone_sim/api/static/index.html` already plays in the browser: both are
+read-mostly clients of one server-side `SimulationRuntime`, polling
+`GET /simulations/{id}/frame`. Pointing this viewer and a browser tab at the
+same `simulation_id` makes them display the exact same live tick -- there is
+exactly one `Simulation` advancing, on the server's background thread, not
+two independent ones.
+
+```bash
+uvicorn drone_sim.api.app:app --reload             # terminal 1
+python scripts/run_visualizer.py --remote          # terminal 2
+```
+
+The CLI prints the `simulation_id` it created and a ready-to-open URL:
+
+```
+Created remote simulation 5a6a3d953364 on http://127.0.0.1:8000
+Open in a browser to view the same simulation: http://127.0.0.1:8000/?simulation_id=5a6a3d953364&x_min=0.0&x_max=172.35&y_min=0.0&y_max=172.35
+```
+
+Opening that URL makes `index.html` *join* the CLI's simulation instead of
+creating its own (`init()` checks the `?simulation_id=` query param before
+falling back to its normal `createSimulation()` flow), and also sets its
+x_min/x_max/y_min/y_max inputs from the URL to match the CLI's own viewport
+(`RemoteSimulationViewer.join_url()` carries them) -- otherwise the browser's
+hardcoded 0-500 default input values could query a different window of the
+world than the CLI viewer, even though both are polling the one shared
+`simulation_id`. Both windows then poll the same `/frame` endpoint with the
+same viewport and always agree on tick, heatmap, and collision markers.
+
+**Two different "collision count" numbers, on purpose, on both clients:**
+`collision markers: N` is the current tick's viewport-filtered marker count
+(from `frame.markers`); `collisions: N` under "cumulative" is a running total
+since the simulation started (`RunningMetrics.total_collisions`, see
+`runtime.py`) and only resets on `reset()`. They will look wildly different
+in a dense/long-running simulation (e.g. hundreds per tick vs. hundreds of
+thousands cumulative) -- that gap is expected, not a bug, as long as both
+clients show *both* numbers with matching labels so it's clear which is
+which. `RemoteSimulationViewer` shows both, mirroring `index.html`'s stats
+panel field-for-field.
+
+The reverse direction also works: create the simulation from the browser
+("Apply / New simulation"), then attach the CLI viewer to it by id (bounds
+are required here since there is no endpoint to recover a simulation's world
+bounds from its id alone -- the viewport concept is a client-chosen query
+window, not necessarily the world's full extent, matching how the browser's
+own x/y input boxes work):
+
+```bash
+python scripts/run_visualizer.py --remote --simulation-id <id> --x-max 500 --y-max 500
+```
+
+Space and R act on the *shared* simulation (pause/resume/reset are server
+calls, visible to every client polling that id), not just this window's
+polling. Closing a viewer that *created* its own simulation deletes it
+server-side on exit, mirroring `index.html`'s `stopSimulationIfAny` --
+otherwise every launch would leak another background thread that runs
+forever (`SimulationRuntime`'s loop only exits on `shutdown()`; see "Root
+cause: orphaned runtime threads" above).
+
+Other flags: `--api-url` (default `http://127.0.0.1:8000`), `--x-bins`/
+`--y-bins` (heatmap resolution requested from the server, default 60x60,
+matching `index.html`), `--poll-interval-ms` (default 150, matching
+`index.html`'s `REFRESH_INTERVAL_MS`).
 
 ## License
 

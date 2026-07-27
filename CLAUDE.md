@@ -12,6 +12,17 @@ controlled collision scenarios added later. Development order is strict:
 
 ## Current status: Phase 1 kernel + Phase 2 AI/scenario control complete; a local debug viewer has been added
 
+> **This section is stale relative to the actual repository.** `README.md`
+> documents a complete Phase 3A (snapshot layer, `SimulationRuntime`,
+> viewport/heatmap/collision-marker queries, a FastAPI app under
+> `src/drone_sim/api/`, and a static browser page) that this file's "Do NOT
+> build yet" list below still says hasn't started. Treat `README.md` as
+> authoritative for current scope until this file is reconciled with it — see
+> the "Browser vs. Matplotlib viewer" investigation note near the bottom of
+> this file for the one Phase 3A change made *during* a CLAUDE.md-governed
+> session (and therefore recorded here per this file's own context note),
+> which does not by itself bring the rest of this file up to date.
+
 The local single-process kernel (Phase 1) is complete and unchanged. Phase 2
 (batched goal-directed movement, trajectory prediction, local collision
 avoidance, controlled rare-collision scenarios, collision-rate validation) is
@@ -41,6 +52,8 @@ python -m pytest -q                         # full suite (142 tests)
 python benchmarks/benchmark_simulation.py   # Phase 1 path only: 1k/10k/100k, headless
 python benchmarks/benchmark_avoidance.py    # Phase 2 avoidance path: 1k/10k/100k, headless
 python scripts/run_visualizer.py --drones 10000 --render-every 5   # local debug viewer
+uvicorn drone_sim.api.app:app --reload                             # Phase 3A API + browser page
+python scripts/run_visualizer.py --remote                          # same viewer, polling that server instead
 ```
 
 `pyproject.toml` sets `pythonpath = ["src"]` and `testpaths = ["tests"]`, so the
@@ -214,6 +227,124 @@ avoidance — they exist so a future learned policy has something trustworthy
 to be measured against, not so it can be skipped. Keep scope to the local
 kernel + Phase 2 AI/scenario control (+ the debug viewer) until asked to
 advance.
+
+## Browser vs. Matplotlib viewer investigation (Phase 3A bug fixes)
+
+A session investigated why an active browser session ran substantially
+slower than the Matplotlib viewer at 10,000 drones. Full writeup:
+README.md's "Browser vs. Matplotlib viewer: isolated-vs-concurrent
+investigation" section. Summary of what changed, so a fresh session doesn't
+relitigate it:
+
+- **Root cause (dominant, measured): orphaned runtime threads.** Every
+  `POST /simulations` left the previous `SimulationRuntime`'s background
+  thread running forever (nothing ever called `shutdown()` on it) — a page
+  reload or "Apply / New simulation" click added another live full-speed
+  simulation thread rather than replacing one. Fixed with a new
+  `DELETE /simulations/{id}` endpoint (`routes.py`) plus `index.html` calling
+  it on the previous simulation before creating a new one
+  (`sessionStorage`-tracked so a reload can clean up too).
+- **Secondary fix: `/frame`'s double JSON serialization + second unmeasured
+  lock acquisition.** `get_frame()` serialized its full payload twice per
+  request (one discarded) and called `get_status()` as a second, unmeasured
+  lock acquisition after `get_snapshot_with_lock_wait()`. Fixed by
+  `SimulationRuntime.get_snapshot_and_status_with_lock_wait()` (one lock read)
+  and a single `json.dumps()` call with a cheap splice for the
+  self-referential timing fields.
+- **Checked, not a meaningful factor:** the browser's default UI-driven world
+  (500x500x100) is 4.75x *sparser* (not denser) than the Matplotlib viewer's
+  `world_side_for()`-scaled world at the same drone count — measured to have
+  negligible effect on tick cost since both worlds have far more spatial-hash
+  cells than drones.
+- `TickProfile` (simulation.py) gained additive, opt-in-only occupancy/pair-
+  count fields (`occupied_cells`, `mean_cell_occupancy`, `max_cell_occupancy`,
+  `candidate_pair_count`, `collision_pair_count`, `near_miss_pair_count`,
+  `active_drone_count`) — zero cost when `profile=None`, same invariant as
+  before. `SpatialHashGrid.occupancy_stats()` is the new small accessor they
+  read from.
+- New `benchmarks/benchmark_viewer_comparison.py` — the controlled comparison
+  behind all of the above; also runnable as four standalone `--demo`s.
+- 218 tests now (was 205) — 13 new, all under the existing Phase 1/2/3A
+  invariants; nothing about movement, collision detection, thresholds,
+  spatial hashing, or boundary behavior changed.
+
+## Matplotlib viewer as a second API client (`--remote`)
+
+A later session made the Matplotlib viewer and the browser page able to
+display **the same live simulation** at once, on request, rather than each
+always owning an independent one. Full writeup: README.md's "Remote mode:
+same data as the browser page" (under "Local debug viewer (prototype)").
+Summary so a fresh session doesn't relitigate it:
+
+- New `src/drone_sim/api_client.py` — a stdlib-`urllib`-only HTTP client
+  (`create_simulation`, `start/pause/resume/reset/delete_simulation`,
+  `get_status`, `get_frame`). Deliberately does not import `httpx`/`requests`
+  or anything from `drone_sim.api`, so the kernel/viz side of the package
+  gains no new hard dependency and stays decoupled from whatever HTTP client
+  the API side happens to use — same import-boundary spirit as
+  `drone_sim/api/app.py`'s "only place that imports FastAPI" comment, just
+  from the other direction.
+- `visualization.py` gained `RemoteSimulationViewer`, sharing the existing
+  `SimulationViewer`'s Matplotlib scaffold (`_build_figure()`, factored out
+  of both) but sourcing its grid from the server's already-binned
+  `heatmap.counts` (see `heatmap.py`) instead of running
+  `numpy.histogram2d` over local positions — it never touches raw drone
+  positions or a local `Simulation` at all. `scripts/run_visualizer.py
+  --remote` uses it: with no `--simulation-id` it creates+starts a
+  simulation on `--api-url` and prints a `?simulation_id=`-joined browser
+  URL; with `--simulation-id` it attaches to one already running (e.g. one
+  the browser created) and requires `--x-max`/`--y-max` since there is no
+  endpoint to recover a simulation's world bounds from its id alone.
+- `static/index.html`'s `init()` now checks `?simulation_id=` before its
+  normal `createSimulation()` call — present means *join* (skip creating,
+  skip the reload-cleanup delete), absent means the original behavior,
+  unchanged.
+- Space/R in the remote viewer call the server's pause/resume/reset
+  endpoints (shared state, visible to every client polling that id), not a
+  client-local toggle. This surfaced a real bug during implementation:
+  guessing pause-vs-resume from the viewer's last-polled status and silently
+  swallowing a 409 let two Space presses faster than one poll interval eat
+  the second keypress (see `RemoteSimulationViewer._toggle_pause_resume`'s
+  docstring) — fixed by retrying the other action on a 409 instead of
+  swallowing it, since the 409 itself proves which state the server was
+  actually in. A viewer that created its own simulation still deletes it
+  server-side on window close, mirroring `index.html`'s
+  `stopSimulationIfAny` leak-prevention above.
+- New `tests/test_api_client.py` spins up a real `uvicorn.Server` in a
+  background thread on a free port (FastAPI's `TestClient` never opens a
+  real socket, and `api_client` specifically needs one) to exercise the
+  client against actual HTTP.
+- 222 tests now (was 218) — 4 new; nothing about movement, collision
+  detection, thresholds, spatial hashing, boundary behavior, or the existing
+  local (non-`--remote`) viewer path changed.
+
+**Follow-up fix, same session, once `--remote` was actually used against a
+live shared simulation:** the GUI and browser showed very different
+"collision" numbers even when pointed at the identical `simulation_id`, for
+two compounding reasons, both now fixed:
+- `RemoteSimulationViewer`'s metrics text only ever showed
+  `total_collisions` (cumulative-since-start, from `RunningMetrics`) with no
+  per-tick count at all -- comparing that against index.html's per-tick
+  `collision markers: N` line looks wildly different by construction (a
+  measured example: ~350 per tick vs. 146,824 cumulative), not because
+  anything was broken. Fixed by adding a `collision markers: {len(markers)}`
+  line to `_poll_and_redraw()`'s output, sourced from the same `frame.markers`
+  index.html reads, so both clients show the *same-shaped* per-tick number
+  next to the *same-shaped* cumulative one.
+- `join_url()` returned only `?simulation_id=`, never the viewport it was
+  actually polling -- `index.html`'s join path left its x_min/x_max/y_min/
+  y_max inputs at their hardcoded 0-500 defaults regardless of what
+  simulation was joined, so the two clients could silently query different
+  windows of the same world (this happened not to truncate anything for
+  every valid `--drones` value at the time, since `world_side_for(100_000)`
+  ≈ 370 < 500, but was still a latent correctness gap, not something to rely
+  on by coincidence). Fixed by having `join_url()` carry `x_min`/`x_max`/
+  `y_min`/`y_max` as query params and `index.html`'s `init()` apply them to
+  the input boxes before the first `refresh()`.
+- 224 tests now (was 222) — 2 new, in `tests/test_visualization.py`
+  (`RemoteSimulationViewer` attach-mode construction needs no network, so
+  these run with `matplotlib.use("Agg")` and a monkeypatched
+  `api_client.get_frame`, not a live server).
 
 ## Context note
 

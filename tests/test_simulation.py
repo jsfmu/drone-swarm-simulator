@@ -143,6 +143,49 @@ def test_profiled_and_unprofiled_runs_produce_identical_detection_results():
     assert np.array_equal(sim_a.world.state.velocities, sim_b.world.state.velocities)
 
 
+# ------------------------------------------------ occupancy/pair-count fields
+def test_profile_includes_occupancy_and_pair_count_fields():
+    config = make_config()
+    world = _world_with_goals(config, LocalAvoidanceMovementAlgorithm.policy_id)
+    sim = _simulation_for(config, LocalAvoidanceMovementAlgorithm.policy_id, LocalAvoidanceMovementAlgorithm(), world)
+
+    profile = TickProfile()
+    sim.step(profile=profile)
+
+    expected_fields = {
+        "occupied_cells", "mean_cell_occupancy", "max_cell_occupancy",
+        "candidate_pair_count", "collision_pair_count", "near_miss_pair_count",
+        "active_drone_count",
+    }
+    assert expected_fields <= set(vars(profile))
+    assert profile.occupied_cells > 0
+    assert profile.active_drone_count == config.num_drones
+    assert profile.candidate_pair_count >= 0
+    assert profile.collision_pair_count >= 0
+    assert profile.near_miss_pair_count >= 0
+    assert profile.mean_cell_occupancy > 0
+    assert profile.max_cell_occupancy >= 1
+
+
+def test_profile_occupancy_stats_match_grid_directly():
+    """profile.occupied_cells/mean_cell_occupancy/max_cell_occupancy/
+    candidate_pair_count must exactly match SpatialHashGrid.occupancy_stats()/
+    candidate_pairs() computed independently from the same post-movement
+    grid -- not an approximation, and not double-counted."""
+    config = make_config()
+    world = _world_with_goals(config, GoalDirectedMovementAlgorithm.policy_id)
+    sim = _simulation_for(config, GoalDirectedMovementAlgorithm.policy_id, GoalDirectedMovementAlgorithm(), world)
+
+    profile = TickProfile()
+    sim.step(profile=profile)
+
+    occupied_cells, mean_occ, max_occ = sim.engine.grid.occupancy_stats()
+    assert profile.occupied_cells == occupied_cells
+    assert profile.mean_cell_occupancy == pytest.approx(mean_occ)
+    assert profile.max_cell_occupancy == max_occ
+    assert profile.candidate_pair_count == sim.engine.grid.candidate_pairs().shape[0]
+
+
 def test_detect_accepts_precomputed_pairs_and_matches_default():
     config = make_config(num_drones=60, bounds_max=(15.0, 15.0, 15.0))
     state = DroneState.generate(config)
