@@ -40,6 +40,24 @@ def _forward_offsets() -> np.ndarray:
 
 _FORWARD_OFFSETS = _forward_offsets()
 
+#: Phase 5 optimization (see benchmarks/phase5_results/optimization_notes.md):
+#: build() additionally fills a dense cell -> unique-cell-index lookup array
+#: when the world isn't too sparse, so candidate_pairs() can replace an
+#: O(log occupied_cells) np.searchsorted() per forward offset with an O(1)
+#: fancy-index gather. Measured 1.4x-1.7x faster at this project's designed
+#: density (~64 cells/drone, see benchmark_simulation.py/benchmark_avoidance.py)
+#: and scales better at 100,000 drones than at 1,000. The two guards below
+#: exist because the same trick measured as low as 0.03x-0.6x (a *regression*)
+#: on a much sparser world: filling a mostly-empty dense array costs
+#: O(total_cells) up front, which dominates once total_cells grows far past
+#: occupied_cells. Both conditions are checked fresh every build() call (cheap:
+#: a couple of scalar comparisons), so a config that happens to be sparse
+#: automatically falls back to the exact pre-optimization searchsorted path in
+#: candidate_pairs() -- same output either way, verified in
+#: test_spatial_hash.py's parametrized dense-vs-sparse equivalence tests.
+_DENSE_LOOKUP_MAX_RATIO = 128.0
+_DENSE_LOOKUP_MAX_CELLS = 20_000_000
+
 
 class SpatialHashGrid:
     """Assigns drones to cells and yields unique neighbour candidate pairs."""
@@ -56,6 +74,7 @@ class SpatialHashGrid:
         self.nx, self.ny, self.nz = (int(self.dims[0]), int(self.dims[1]), int(self.dims[2]))
         self._lo = lo
         self._plane = self.nx * self.ny  # stride for z in the linear key
+        self._total_cells = self.nx * self.ny * self.nz
 
         # Populated by build().
         self._built = False
@@ -64,6 +83,9 @@ class SpatialHashGrid:
         self._counts: np.ndarray | None = None
         self._sorted_drones: np.ndarray | None = None
         self._ucx = self._ucy = self._ucz = None
+        #: Dense cell -> unique-cell-index lookup, or ``None`` when this
+        #: build's world is too sparse for it to be worthwhile (see above).
+        self._lookup: np.ndarray | None = None
 
     # ------------------------------------------------------------------ build
     def cell_coords(self, positions: np.ndarray) -> np.ndarray:
@@ -89,6 +111,7 @@ class SpatialHashGrid:
             self._counts = np.empty(0, dtype=np.int64)
             self._sorted_drones = np.empty(0, dtype=np.int64)
             self._ucx = self._ucy = self._ucz = np.empty(0, dtype=np.int64)
+            self._lookup = None
             return
 
         coords = self.cell_coords(positions[active_indices])
@@ -98,9 +121,18 @@ class SpatialHashGrid:
         sorted_keys = keys[order]
         self._sorted_drones = active_indices[order].astype(np.int64)
 
-        unique_keys, group_start, counts = np.unique(
-            sorted_keys, return_index=True, return_counts=True
-        )
+        # Unique keys/group starts/counts directly from the already-sorted
+        # array (O(n)) instead of np.unique(..., return_index=True,
+        # return_counts=True), which internally re-sorts its input with no
+        # "already sorted" fast path -- a measured, redundant O(n log n) on
+        # data argsort() just produced (see benchmarks/phase5_results).
+        is_new = np.empty(sorted_keys.shape[0], dtype=bool)
+        is_new[0] = True
+        np.not_equal(sorted_keys[1:], sorted_keys[:-1], out=is_new[1:])
+        group_start = np.flatnonzero(is_new)
+        unique_keys = sorted_keys[group_start]
+        counts = np.diff(group_start, append=sorted_keys.shape[0])
+
         self._unique_keys = unique_keys
         self._group_start = group_start.astype(np.int64)
         self._counts = counts.astype(np.int64)
@@ -110,6 +142,22 @@ class SpatialHashGrid:
         rem = unique_keys % self._plane
         self._ucy = rem // self.nx
         self._ucx = rem % self.nx
+
+        # Dense cell -> unique-cell-index lookup, only when the world isn't
+        # too sparse for it to pay off (see the module-level constants'
+        # docstring). Guards are cheap scalar checks, re-evaluated every
+        # build() so a config's actual occupancy -- not a fixed assumption --
+        # decides the strategy each tick.
+        occupied = unique_keys.shape[0]
+        if (
+            self._total_cells <= _DENSE_LOOKUP_MAX_CELLS
+            and self._total_cells <= _DENSE_LOOKUP_MAX_RATIO * max(occupied, 1)
+        ):
+            lookup = np.full(self._total_cells, -1, dtype=np.int32)
+            lookup[unique_keys] = np.arange(occupied, dtype=np.int32)
+            self._lookup = lookup
+        else:
+            self._lookup = None
 
     # ----------------------------------------------------------- diagnostics
     def occupancy_stats(self) -> tuple[int, float, int]:
@@ -155,6 +203,7 @@ class SpatialHashGrid:
 
         # --- cross-cell pairs (13 forward neighbour offsets), vectorised.
         ucx, ucy, ucz = self._ucx, self._ucy, self._ucz
+        lookup = self._lookup
         for dx, dy, dz in _FORWARD_OFFSETS:
             ncx = ucx + dx
             ncy = ucy + dy
@@ -170,10 +219,17 @@ class SpatialHashGrid:
             src_cells = np.nonzero(valid)[0]
             nkey = ncx[src_cells] + ncy[src_cells] * self.nx + ncz[src_cells] * self._plane
 
-            pos = np.searchsorted(uk, nkey)
-            in_range = pos < uk.size
-            exists = np.zeros(pos.shape, dtype=bool)
-            exists[in_range] = uk[pos[in_range]] == nkey[in_range]
+            if lookup is not None:
+                # O(1) gather -- see build()'s dense-lookup docstring. Same
+                # result as the searchsorted branch below, just faster
+                # whenever this build's world was dense enough to earn it.
+                pos = lookup[nkey].astype(np.int64)
+                exists = pos >= 0
+            else:
+                pos = np.searchsorted(uk, nkey)
+                in_range = pos < uk.size
+                exists = np.zeros(pos.shape, dtype=bool)
+                exists[in_range] = uk[pos[in_range]] == nkey[in_range]
             if not exists.any():
                 continue
 

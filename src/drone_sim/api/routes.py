@@ -25,6 +25,8 @@ from fastapi.responses import Response, StreamingResponse
 
 from ..collision_queries import query_collision_markers
 from ..config import SimulationConfig
+from ..coordinator import DistributedConfig
+from ..distributed_runtime import DistributedSimulationRuntime
 from ..heatmap import HeatmapQuery, compute_heatmap
 from ..movement import (
     GoalDirectedMovementAlgorithm,
@@ -48,7 +50,12 @@ from .models import (
 
 router = APIRouter()
 
-_runtimes: dict[str, SimulationRuntime] = {}
+#: Phase 5: a simulation's runtime is either a single-process SimulationRuntime
+#: (the default) or a DistributedSimulationRuntime (opt-in via
+#: CreateSimulationRequest.distributed=True) -- both implement the identical
+#: method surface every handler below calls, so nothing else in this file
+#: needs to branch on which kind a given simulation_id actually has.
+_runtimes: dict[str, "SimulationRuntime | DistributedSimulationRuntime"] = {}
 
 #: Hard cap on raw drone positions returned by /viewport in one response.
 #: A viewport with more visible drones than this still gets full heatmap
@@ -90,6 +97,14 @@ async def _client_disconnected(request: Request) -> bool:
 #: diagnostics. Incremented/decremented only in the stream generator's
 #: try/finally, so it is accurate even when a client disconnects mid-frame.
 _stream_connection_counts: dict[str, int] = {}
+
+#: Phase 5 monitoring (see api/monitoring.py's /metrics): process-wide,
+#: best-effort counters across every stream connection this process has ever
+#: served. Plain module-level ints rather than a lock-guarded accumulator --
+#: these are operational counters for a metrics display, never used for any
+#: correctness decision, so CPython's GIL-serialized += is sufficient.
+_stream_frames_published_total = 0
+_stream_frames_superseded_total = 0
 
 
 def _default_goal_positions(config: SimulationConfig, positions: np.ndarray) -> np.ndarray:
@@ -167,20 +182,23 @@ def reset_registry() -> None:
     _runtimes.clear()
 
 
-def _get_runtime(simulation_id: str) -> SimulationRuntime:
+def _get_runtime(simulation_id: str) -> "SimulationRuntime | DistributedSimulationRuntime":
     runtime = _runtimes.get(simulation_id)
     if runtime is None:
         raise HTTPException(status_code=404, detail=f"unknown simulation_id {simulation_id!r}")
     return runtime
 
 
-def _status_response(runtime: SimulationRuntime) -> SimulationStatusResponse:
+def _status_response(runtime: "SimulationRuntime | DistributedSimulationRuntime") -> SimulationStatusResponse:
     state = runtime.get_status()
+    is_distributed = isinstance(runtime, DistributedSimulationRuntime)
     return SimulationStatusResponse(
         simulation_id=state.simulation_id,
         status=state.status.value,
         tick=state.tick,
         num_drones=state.num_drones,
+        execution_mode="distributed" if is_distributed else "single_process",
+        num_workers=runtime._dist_config.num_workers if is_distributed else None,
     )
 
 
@@ -212,10 +230,29 @@ def create_simulation(req: CreateSimulationRequest) -> SimulationStatusResponse:
 
     movement = _build_movement_system(req.policy)
     world_factory = _build_world_factory(req)
-    _runtimes[simulation_id] = SimulationRuntime(
-        simulation_id, config, movement=movement, world_factory=world_factory
-    )
-    return _status_response(_runtimes[simulation_id])
+
+    if req.distributed:
+        dist_config = DistributedConfig(
+            num_workers=req.num_workers,
+            num_partitions=req.num_partitions,
+            use_threads=(req.executor == "threads"),
+            use_processes=(req.executor == "processes"),
+        )
+        try:
+            runtime: "SimulationRuntime | DistributedSimulationRuntime" = DistributedSimulationRuntime(
+                simulation_id, config, dist_config, movement=movement, world_factory=world_factory
+            )
+        except (ValueError, NotImplementedError) as exc:
+            # NotImplementedError: a requires_context policy (e.g.
+            # local_avoidance) was requested with distributed=True --
+            # DistributedCoordinator rejects this before any worker pool is
+            # created (see distributed_runtime.py), so nothing to clean up.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        runtime = SimulationRuntime(simulation_id, config, movement=movement, world_factory=world_factory)
+
+    _runtimes[simulation_id] = runtime
+    return _status_response(runtime)
 
 
 @router.get("/simulations/{simulation_id}", response_model=SimulationStatusResponse)
@@ -394,7 +431,13 @@ def get_collisions(
 def get_metrics(simulation_id: str) -> MetricsResponse:
     runtime = _get_runtime(simulation_id)
     snapshot = runtime.get_snapshot()
-    return MetricsResponse(simulation_id=simulation_id, tick=snapshot.tick, metrics=snapshot.metrics)
+    distributed_metrics = (
+        runtime.get_distributed_metrics() if isinstance(runtime, DistributedSimulationRuntime) else None
+    )
+    return MetricsResponse(
+        simulation_id=simulation_id, tick=snapshot.tick, metrics=snapshot.metrics,
+        distributed_metrics=distributed_metrics,
+    )
 
 
 def _build_frame_components(
@@ -588,9 +631,11 @@ async def stream_simulation(
     interval_s = 1.0 / hz
 
     async def event_generator():
+        global _stream_frames_published_total, _stream_frames_superseded_total
         _stream_connection_counts[simulation_id] = _stream_connection_counts.get(simulation_id, 0) + 1
         seq = 0
         consecutive_errors = 0
+        last_tick: Optional[int] = None
         try:
             while True:
                 if await _client_disconnected(request):
@@ -621,6 +666,11 @@ async def stream_simulation(
                     await asyncio.sleep(interval_s)
                     continue
                 consecutive_errors = 0
+
+                _stream_frames_published_total += 1
+                if last_tick is not None and _tick - last_tick > 1:
+                    _stream_frames_superseded_total += _tick - last_tick - 1
+                last_tick = _tick
 
                 yield f"id: {seq}\ndata: {body}\n\n"
                 await asyncio.sleep(interval_s)

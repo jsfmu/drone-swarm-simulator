@@ -1,0 +1,206 @@
+{
+  "args": {
+    "drones": [
+      1000,
+      10000,
+      50000,
+      100000
+    ],
+    "ticks": 10,
+    "warmup": 3,
+    "policy": "goal_directed",
+    "mode": "both",
+    "workers": [
+      1,
+      4,
+      8
+    ],
+    "executor": "process",
+    "profile": false,
+    "checkpoint_bench": true,
+    "json_out": "benchmarks/phase5_results/final_run.json",
+    "csv_out": null
+  },
+  "local_results": [
+    {
+      "drones": 1000,
+      "policy": "goal_directed",
+      "mean_ms": 8.730980000018462,
+      "median_ms": 8.488599999964208,
+      "p95_ms": 15.166014999863362,
+      "ticks_per_s": 114.5346799555016,
+      "peak_rss_mb": 42.704896,
+      "stage_ms": null
+    },
+    {
+      "drones": 10000,
+      "policy": "goal_directed",
+      "mean_ms": 47.59598000000551,
+      "median_ms": 30.700199999955657,
+      "p95_ms": 112.9751599999963,
+      "ticks_per_s": 21.01017775030337,
+      "peak_rss_mb": 73.60512,
+      "stage_ms": null
+    },
+    {
+      "drones": 50000,
+      "policy": "goal_directed",
+      "mean_ms": 89.27596999992602,
+      "median_ms": 70.48504999988836,
+      "p95_ms": 174.79656999998946,
+      "ticks_per_s": 11.201222456623308,
+      "peak_rss_mb": 96.669696,
+      "stage_ms": null
+    },
+    {
+      "drones": 100000,
+      "policy": "goal_directed",
+      "mean_ms": 138.64180000000488,
+      "median_ms": 118.75899999995454,
+      "p95_ms": 218.27760999995002,
+      "ticks_per_s": 7.212831916492464,
+      "peak_rss_mb": 114.9952,
+      "stage_ms": null
+    }
+  ],
+  "distributed_results": [
+    {
+      "drones": 1000,
+      "workers": 1,
+      "executor": "process",
+      "mean_ms": 11.620839999977761,
+      "ticks_per_s": 86.05229914549324,
+      "collisions_last_tick": 98,
+      "peak_rss_mb": 114.9952
+    },
+    {
+      "drones": 1000,
+      "workers": 4,
+      "executor": "process",
+      "mean_ms": 15.161320000015621,
+      "ticks_per_s": 65.95731770050165,
+      "collisions_last_tick": 104,
+      "peak_rss_mb": 114.9952
+    },
+    {
+      "drones": 1000,
+      "workers": 8,
+      "executor": "process",
+      "mean_ms": 12.547680000034234,
+      "ticks_per_s": 79.6960075485884,
+      "collisions_last_tick": 97,
+      "peak_rss_mb": 114.9952
+    },
+    {
+      "drones": 10000,
+      "workers": 1,
+      "executor": "process",
+      "mean_ms": 57.28966000001492,
+      "ticks_per_s": 17.455156829343018,
+      "collisions_last_tick": 8325,
+      "peak_rss_mb": 114.9952
+    },
+    {
+      "drones": 10000,
+      "workers": 4,
+      "executor": "process",
+      "mean_ms": 52.708440000060364,
+      "ticks_per_s": 18.97229362126549,
+      "collisions_last_tick": 8152,
+      "peak_rss_mb": 114.9952
+    },
+    {
+      "drones": 10000,
+      "workers": 8,
+      "executor": "process",
+      "mean_ms": 49.902929999962,
+      "ticks_per_s": 20.038903527323175,
+      "collisions_last_tick": 8367,
+      "peak_rss_mb": 114.9952
+    },
+    {
+      "drones": 50000,
+      "workers": 1,
+      "executor": "process",
+      "mean_ms": 113.997499999914,
+      "ticks_per_s": 8.772122195668803,
+      "collisions_last_tick": 10590,
+      "peak_rss_mb": 114.9952
+    },
+    {
+      "drones": 50000,
+      "workers": 4,
+      "executor": "process",
+      "mean_ms": 82.31361000007382,
+      "ticks_per_s": 12.148659255730651,
+      "collisions_last_tick": 9918,
+      "peak_rss_mb": 114.9952
+    },
+    {
+      "drones": 50000,
+      "workers": 8,
+      "executor": "process",
+      "mean_ms": 73.4377300000233,
+      "ticks_per_s": 13.61697862937325,
+      "collisions_last_tick": 9916,
+      "peak_rss_mb": 114.9952
+    },
+    {
+      "drones": 100000,
+      "workers": 1,
+      "executor": "process",
+      "mean_ms": 191.7492599999605,
+      "ticks_per_s": 5.215143985432883,
+      "collisions_last_tick": 9780,
+      "peak_rss_mb": 114.9952
+    },
+    {
+      "drones": 100000,
+      "workers": 4,
+      "executor": "process",
+      "mean_ms": 115.48886999999013,
+      "ticks_per_s": 8.65884305561294,
+      "collisions_last_tick": 10159,
+      "peak_rss_mb": 114.9952
+    },
+    {
+      "drones": 100000,
+      "workers": 8,
+      "executor": "process",
+      "mean_ms": 100.39500999996562,
+      "ticks_per_s": 9.960654418983,
+      "collisions_last_tick": 10159,
+      "peak_rss_mb": 114.9952
+    }
+  ],
+  "checkpoint_results": [
+    {
+      "drones": 1000,
+      "save_ms": 8.511999999882391,
+      "load_ms": 14.214900000297348,
+      "file_bytes": 45170,
+      "resume_matches_uninterrupted": true
+    },
+    {
+      "drones": 10000,
+      "save_ms": 3.1146999999691616,
+      "load_ms": 23.29200000031051,
+      "file_bytes": 414186,
+      "resume_matches_uninterrupted": true
+    },
+    {
+      "drones": 50000,
+      "save_ms": 3.928900000119029,
+      "load_ms": 12.40090000010241,
+      "file_bytes": 2054186,
+      "resume_matches_uninterrupted": true
+    },
+    {
+      "drones": 100000,
+      "save_ms": 5.88659999993979,
+      "load_ms": 18.5895999998138,
+      "file_bytes": 4104190,
+      "resume_matches_uninterrupted": true
+    }
+  ]
+}

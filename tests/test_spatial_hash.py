@@ -125,3 +125,54 @@ def test_occupancy_stats_requires_build_first():
     grid = SpatialHashGrid(cfg(10))
     with pytest.raises(RuntimeError):
         grid.occupancy_stats()
+
+
+# --------------------------------------------------- Phase 5: dense lookup path
+def test_dense_lookup_used_for_a_dense_world():
+    """A world at this project's designed density (~64 cells/drone, see
+    benchmark_simulation.py) should be dense enough for build() to populate
+    the O(1) lookup array (see spatial_hash.py's module-level docstring)."""
+    c = cfg(2_000, world=20.0, near=2.0, cell=2.0, seed=0)  # small world, cell_size==near -> dense
+    state = DroneState.generate(c)
+    grid = SpatialHashGrid(c)
+    grid.build(state.positions, state.active_indices())
+    assert grid._lookup is not None
+
+
+def test_dense_lookup_not_used_for_a_very_sparse_world():
+    """A world far sparser than the design target must fall back to
+    searchsorted rather than allocate a huge, mostly-empty lookup array."""
+    c = cfg(50, world=5_000.0, near=2.0, cell=2.0, seed=0)  # huge world, few drones
+    state = DroneState.generate(c)
+    grid = SpatialHashGrid(c)
+    grid.build(state.positions, state.active_indices())
+    assert grid._lookup is None
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.parametrize(
+    "world,near,n",
+    [
+        (20.0, 2.0, 500),      # dense -> exercises the lookup-array branch
+        (5_000.0, 2.0, 50),    # sparse -> exercises the searchsorted fallback branch
+    ],
+)
+def test_dense_and_searchsorted_paths_agree(seed, world, near, n):
+    """Both candidate_pairs() branches (dense lookup vs. searchsorted) must
+    produce byte-for-byte the same pair set given the same built grid --
+    forcing _lookup off after a real (possibly dense) build isolates the
+    branch actually taken from the result, proving they're equivalent, not
+    just each individually correct in the case they normally run in."""
+    c = cfg(n, world=world, near=near, cell=near, seed=seed)
+    state = DroneState.generate(c)
+    grid = SpatialHashGrid(c)
+    grid.build(state.positions, state.active_indices())
+
+    with_current_strategy = _pair_set(grid.candidate_pairs())
+
+    forced_lookup = grid._lookup
+    grid._lookup = None
+    without_lookup = _pair_set(grid.candidate_pairs())
+    grid._lookup = forced_lookup
+
+    assert with_current_strategy == without_lookup

@@ -151,6 +151,17 @@ class SimulationEngine:
         runs the extended Phase 2 tick flow or the plain Phase 1 one."""
         return self._needs_context
 
+    def get_rng_state(self) -> dict:
+        """The movement RNG's exact bit-generator state (Phase 5 checkpointing:
+        see ``drone_sim.checkpoint``). Capturing this — not just the original
+        ``config.seed`` — is what lets a resumed run's random draws continue
+        the same stream instead of restarting it."""
+        return self._rng.bit_generator.state
+
+    def set_rng_state(self, state: dict) -> None:
+        """Restore a previously captured ``get_rng_state()`` result."""
+        self._rng.bit_generator.state = state
+
     def step(
         self, world: World, clock: SimulationClock, profile: TickProfile | None = None
     ) -> tuple[DetectionResult, float]:

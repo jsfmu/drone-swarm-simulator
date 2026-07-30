@@ -22,6 +22,16 @@ controlled collision scenarios added later. Development order is strict:
 > this file for the one Phase 3A change made *during* a CLAUDE.md-governed
 > session (and therefore recorded here per this file's own context note),
 > which does not by itself bring the rest of this file up to date.
+>
+> **Further update:** Phase 3B, Phase 4, and now **Phase 5 (optimization and
+> deployment) are also complete** — see README.md's "Phase 5: Optimization
+> and deployment" section (authoritative) and this file's own "Phase 5"
+> section near the bottom for a summary. This paragraph is intentionally
+> layered on top of the stale-notice above rather than rewriting it, matching
+> how the Phase 4/Phase 3B sessions before it handled the same situation —
+> the header line above is now stale on *two* counts (Phase 3A and Phase 5),
+> not reconciled here for the same reason those weren't: full reconciliation
+> of this file is a larger, separate effort than any one session's changes.
 
 The local single-process kernel (Phase 1) is complete and unchanged. Phase 2
 (batched goal-directed movement, trajectory prediction, local collision
@@ -54,6 +64,9 @@ python benchmarks/benchmark_avoidance.py    # Phase 2 avoidance path: 1k/10k/100
 python scripts/run_visualizer.py --drones 10000 --render-every 5   # local debug viewer
 uvicorn drone_sim.api.app:app --reload                             # Phase 3A API + browser page
 python scripts/run_visualizer.py --remote                          # same viewer, polling that server instead
+python benchmarks/benchmark_phase5.py                               # Phase 5: optimization/scaling/parallel-execution benchmark
+python scripts/smoke_test.py --base-url http://127.0.0.1:8000       # Phase 5 deployment smoke test (add --base-url to skip Docker)
+docker compose up --build                                           # Phase 5 local deployment (not verified in this repo's dev environment -- see README)
 ```
 
 `pyproject.toml` sets `pythonpath = ["src"]` and `testpaths = ["tests"]`, so the
@@ -215,18 +228,33 @@ walkthrough and the trajectory-prediction math.
 
 ## Do NOT build yet (later phases)
 
-`NeuralAvoidanceMovementAlgorithm` and any online reinforcement learning,
-REST/WebSocket/SSE APIs, RealtimeGateway, Redis or any DB, WorkerCoordinator /
-distributed workers, PartitionExchangeService, GPU acceleration, and the
-React/Canvas/WebGL production dashboard. The Matplotlib local debug viewer
-above is explicitly in scope as a Phase 1 debugging aid; it is not a step
-toward the production dashboard's tech stack. Deterministic avoidance
-(`LocalAvoidanceMovementAlgorithm`) and its validation harness
-(`CollisionRateValidator`) are the required prerequisite for neural
-avoidance — they exist so a future learned policy has something trustworthy
-to be measured against, not so it can be skipped. Keep scope to the local
-kernel + Phase 2 AI/scenario control (+ the debug viewer) until asked to
-advance.
+> **Update:** this list (and the header above) predates Phase 3A/3B/4, all of
+> which are now implemented — see README.md (authoritative) and the "Phase 4:
+> Distributed execution" addendum near the bottom of this file.
+> `WorkerCoordinator`/distributed workers/`PartitionExchangeService`-style
+> functionality is **no longer** out of scope; it now exists as
+> `drone_sim.coordinator.DistributedCoordinator` (worker pool + spatial
+> partitions), local/in-process only. Still genuinely out of scope: online
+> reinforcement learning, `NeuralAvoidanceMovementAlgorithm`, Redis or any DB,
+> a real multi-machine cluster/RPC layer, GPU acceleration, and the
+> React/Canvas/WebGL production dashboard's remaining unbuilt pieces beyond
+> Phase 3B's first bounded version. Deterministic avoidance
+> (`LocalAvoidanceMovementAlgorithm`) and its validation harness
+> (`CollisionRateValidator`) remain the required prerequisite for neural
+> avoidance, unchanged.
+>
+> **Phase 5 update:** Redis and GPU acceleration have now actually been
+> *evaluated* (not just deferred) and explicitly rejected on measured
+> evidence — see README.md's Phase 5 section, points 5-6, and
+> `benchmarks/phase5_results/gpu_native_evaluation.json`. This is a different
+> claim than "still out of scope": it means a real profiling/benchmarking
+> pass was done and neither was justified, not that nobody looked. A process
+> -backed (not GPU/Redis) executor **was** added — `WorkerPool`/
+> `DistributedCoordinator`'s new opt-in `use_processes=True`, still entirely
+> local/in-process (no real network/cluster), so the "real multi-machine
+> cluster/RPC layer" exclusion above is unchanged. Neural avoidance, online
+> RL, a real DB, and cloud/Kubernetes deployment remain untouched and out of
+> scope.
 
 ## Browser vs. Matplotlib viewer investigation (Phase 3A bug fixes)
 
@@ -345,6 +373,226 @@ two compounding reasons, both now fixed:
   (`RemoteSimulationViewer` attach-mode construction needs no network, so
   these run with `matplotlib.use("Agg")` and a monkeypatched
   `api_client.get_frame`, not a live server).
+
+## Phase 4: Distributed execution (local logical workers)
+
+A session implemented Phase 4 exactly as scoped by README.md's roadmap
+(worker coordinator/pool, spatial partitions, boundary-drone exchange,
+partition rebalancing, worker failure recovery) — **not** the older
+GPU/CUDA-flavored "Phase 4" some prior planning conversations may have
+implied; GPU work stays under Phase 5 ("Optional native or GPU
+acceleration"), untouched. Full writeup: README.md's "Phase 4: Distributed
+execution" section. Summary so a fresh session doesn't relitigate it:
+
+- New modules, additive only — `simulation.py`/`Simulation` is completely
+  unchanged: `src/drone_sim/partition.py` (`PartitionGrid`, deterministic
+  X-axis slab partitioning — 1-D by design, not a full 3-D grid, since it
+  makes neighbor/halo queries exact and trivial while satisfying every
+  Phase 4 requirement), `src/drone_sim/worker.py` (`Worker`, `WorkerPool`,
+  `WorkerLifecycleState`, fault injection), `src/drone_sim/coordinator.py`
+  (`DistributedConfig`, `DistributedCoordinator`).
+- **Ownership model:** one authoritative `World` lives in the coordinator;
+  a drone's partition is derived each tick from its position (never stored),
+  so ownership transfer on crossing a boundary is automatic. Which *worker*
+  runs a given partition is the only thing rebalancing/failure-recovery
+  mutates (`coordinator.partition_worker`); drone-to-partition assignment
+  stays purely spatial and is never itself migrated.
+- **Cross-partition collision dedup rule:** a pair `(i, j)` is kept only
+  from the partition `p == min(owner(i), owner(j))` — lower partition id
+  always wins the tie. Applied uniformly to collision/near-miss/candidate
+  pairs.
+- **Tick-level transactional commit:** movement + detection are always
+  computed into fresh staging arrays; `world.state` is mutated exactly once,
+  after a fully successful attempt. A `WorkerFailure` mid-attempt leaves
+  authoritative state completely untouched. Retries use per-`(seed, tick,
+  partition_id)`-derived RNG (never per-worker), so retries/reassignment are
+  bit-for-bit deterministic regardless of which healthy worker ends up
+  running a partition.
+- **Explicitly out of scope, not silently approximated:**
+  `LocalAvoidanceMovementAlgorithm` (`requires_context=True`) is rejected by
+  `DistributedCoordinator.__init__` with `NotImplementedError` — correct
+  cross-partition `MovementContext` exchange needs a second, pre-movement
+  ghost round-trip that this phase does not implement. `Simulation` (plain,
+  single-process) still supports it fully, unchanged.
+- **Known, pre-existing (not new) subtlety:** `CollisionResolutionEngine`
+  processes pairs sequentially, so a drone with 2+ simultaneous collisions
+  in one tick can resolve in a different order — and therefore produce a
+  slightly different result — depending on partition count. This is a
+  property of the unmodified single-worker kernel becoming visible under
+  partitioning, not a Phase 4 correctness bug; observed directly in
+  `benchmark_distributed.py`'s dense 5,000-drone case (374 vs. 371 cumulative
+  collisions between `coordinator_1w` and `coordinator_4w`, with every
+  individual tick's collision *pairs* still agreeing exactly).
+- New `benchmarks/benchmark_distributed.py` — `single_worker` vs.
+  `coordinator_1w` vs. `coordinator_Nw`, all `GoalDirectedMovementAlgorithm`
+  (deterministic, no RNG, so cross-partition-count agreement is a meaningful
+  check) — reports overhead (not speedup: `coordinator_Nw` is measured
+  slower than `single_worker` here, since N logical workers still run
+  sequentially in one Python process/GIL by default), agreement, determinism,
+  and rebalancing behavior.
+- 276 tests now (was 241) — 35 new across `tests/test_partition.py`,
+  `tests/test_worker.py`, `tests/test_coordinator.py`; nothing about
+  movement, collision detection, thresholds, spatial hashing, boundary
+  behavior, or the single-process `Simulation` path changed.
+
+## Phase 5: Optimization and deployment
+
+A session implemented Phase 5 as scoped by README.md's roadmap: measure
+first, optimize only what measurements identify, evaluate (not
+default-add) native/GPU/Redis infrastructure, then monitoring/checkpointing/
+deployment. Full writeup: README.md's "Phase 5: Optimization and deployment"
+section. Summary so a fresh session doesn't relitigate it:
+
+- **The one real hot-path optimization, measured not assumed:**
+  `SpatialHashGrid.build()`/`candidate_pairs()` (`spatial_hash.py`) gained a
+  dense cell->unique-cell-index lookup array, used instead of
+  `np.searchsorted()` whenever the world is dense enough for it to pay off
+  (two cheap per-build guard constants; falls back to the original
+  `searchsorted` path otherwise — the same trick regressed to 0.03x-0.6x on
+  a sparse world, which is *why* the guards exist, not a hypothetical).
+  Measured 1.3x-1.7x on `benchmark_simulation.py`/`benchmark_avoidance.py` at
+  every scale from 1,000-100,000 drones, byte-identical collision/near-miss
+  counts before and after. `build()` also stopped calling `np.unique()` on an
+  array that `argsort()` had just fully sorted (a redundant O(n log n) now
+  O(n)) — a smaller, free win folded into the same change.
+- **`WorkerPool`/`DistributedCoordinator` gained a third, opt-in execution
+  backend: `use_processes=True`** (mutually exclusive with the existing
+  `use_threads`), a persistent `ProcessPoolExecutor` (not per-tick — that
+  would pay spawn cost every tick). Added *because* measurement justified it:
+  threading measured **no benefit** (GIL not released long enough by these
+  NumPy calls), while a real process pool measured a genuine 1.2x-1.8x
+  speedup at 4-8 workers / 20,000-100,000 drones — but is *worse* than
+  sequential at 1 worker, which is why it's opt-in, not the new default.
+  Fault injection is checked in the parent process before any job crosses the
+  process boundary, so it works identically across all three modes.
+  `WorkerPool.shutdown()`/`DistributedCoordinator.shutdown()` release the
+  pool — always call it when done with `use_processes=True`, or worker
+  processes leak.
+- **GPU and native (Numba/Cython/Rust) acceleration were evaluated and
+  explicitly rejected**, not silently skipped — see
+  `benchmarks/phase5_results/gpu_native_evaluation.json` for the evidence
+  (no CUDA-capable stack installed on the dev machine; the hot path is an
+  irregular gather/scatter workload, not GPU-shaped; post-optimization
+  profiling shows no remaining single Python-loop bottleneck to justify a
+  new compiled dependency).
+- **Redis was evaluated and explicitly rejected.** The existing SSE stream
+  (`GET .../stream`, Phase 3B) already has no queue anywhere (latest-state
+  semantics) — Phase 5 added direct tests for multi-consumer isolation
+  (`test_stream_multiple_concurrent_consumers_each_get_advancing_frames`) and
+  slow-consumer isolation
+  (`test_stream_slow_consumer_does_not_block_simulation_or_other_consumers`),
+  both passing, confirming the existing design already satisfies what Redis
+  would otherwise be brought in to solve.
+- **New `drone_sim.api.monitoring` module**: `GET /health` (liveness, always
+  ok), `GET /ready` (readiness, gated on a FastAPI `lifespan` startup flag —
+  a real, if currently trivial, distinction from `/health`), `GET /metrics`
+  (per-simulation tick/status/drone-count/tick-timing/collision figures from
+  the existing `SimulationSnapshot`/`RunningMetrics`, plus process RSS via
+  new stdlib-only `drone_sim.process_metrics`, plus API request count/latency
+  via a small timing middleware, plus streaming counters). Distributed
+  -execution metrics (`DistributedCoordinator.metrics_summary()`) were **not**
+  a live endpoint when Phase 5 first shipped — deliberate scope, not an
+  oversight, since the API only ever ran a plain `Simulation` via
+  `SimulationRuntime` at that point. **A follow-up session closed this**: see
+  the "Distributed execution via the API" note below — `GET /metrics` now
+  includes a per-simulation `"distributed"` key when applicable.
+- **New `drone_sim.checkpoint` module**: versioned (`.npz`, not pickle),
+  atomic (`os.replace()` after a fully-written temp file), deterministic
+  -resume simulation checkpointing for a plain `Simulation`. Captures the
+  movement RNG's exact bit-generator state (new
+  `SimulationEngine.get_rng_state()`/`set_rng_state()`), not just
+  `config.seed` — required for `RandomMovementAlgorithm` to resume its exact
+  draw sequence. Deliberately does NOT persist locks/threads/sockets/worker
+  handles, the full per-tick metrics history (diagnostic, unbounded — a
+  resumed `Simulation` starts with an empty one, same as a brand-new one), or
+  movement-policy objects (constructor arguments to `load_checkpoint()`, same
+  as `Simulation` already takes). `load_checkpoint()` never starts background
+  execution.
+- **New deployment artifacts**: root `Dockerfile` (backend, multi-stage,
+  non-root, `HOST`/`PORT` env vars), `frontend/Dockerfile` +
+  `frontend/nginx.conf` (multi-stage, `VITE_API_BASE_URL` as a **build arg**
+  since Vite bakes `import.meta.env.*` in at build time), `docker-compose.yml`
+  (health-gated startup, bounded default resource limits), and
+  `scripts/smoke_test.py` (build -> up -> wait for `/ready` -> create sim ->
+  status -> step + `/frame` -> pause -> down; `--base-url` skips the
+  docker-compose-managed steps to test the HTTP sequence alone). **Docker
+  was not available on the machine this was originally implemented on** --
+  it was subsequently installed (WSL2 + Docker Desktop) in the same session
+  and a real `docker compose up --build` was run, which caught a genuine bug
+  a non-containerized smoke test never could: `pyproject.toml` had no
+  `[tool.setuptools.package-data]` entry, so a real (non-editable) `pip
+  install ".[api]"` silently dropped `api/static/index.html` (every local
+  dev workflow uses `pip install -e`, which never hits this). Fixed by
+  adding `"drone_sim.api" = ["static/*", "static/**/*"]` to
+  `pyproject.toml`. After the fix, `docker compose up --build` starts both
+  containers healthy and `scripts/smoke_test.py` passes against them for
+  real — see README.md's Phase 5 "Deployment" subsection.
+- New `benchmarks/benchmark_phase5.py` — the single bounded, parametrized
+  entry point (drone count, tick count, policy, local/distributed, worker
+  count, executor choice, checkpoint benchmarking, profiling on/off,
+  JSON/CSV output) the Phase 5 spec asked for, reusing
+  `benchmark_simulation.py`'s world-scaling helper and
+  `benchmark_avoidance.py`'s memory-measurement helper rather than
+  duplicating them.
+- **319 tests now (was 276)** — 43 new: 17 in `tests/test_checkpoint.py`, 8
+  in `tests/test_monitoring.py`, 5 process-executor tests in
+  `tests/test_worker.py`, 3 in `tests/test_coordinator.py`, 3 dense-lookup
+  -equivalence tests in `tests/test_spatial_hash.py`, 2 event-transport
+  tests in `tests/test_stream.py`. Nothing about movement, collision
+  detection, thresholds, spatial hashing, boundary behavior, or any
+  pre-existing endpoint's observable behavior changed. Frontend unchanged
+  (still 39 Vitest tests, production build still succeeds) — Phase 5 made no
+  frontend code changes.
+
+## Distributed execution via the API (follow-up session, after Phase 5)
+
+Closed a gap Phase 5 explicitly left open (see `DistributedCoordinator
+.metrics_summary()`'s original docstring, and CLAUDE.md's Phase 5 summary
+above): the FastAPI layer previously only ever drove a plain `Simulation` via
+`SimulationRuntime`, never a `DistributedCoordinator`. Full writeup:
+README.md's "Distributed mode via the API" subsection. Summary so a fresh
+session doesn't relitigate it:
+
+- **New `drone_sim.distributed_runtime.DistributedSimulationRuntime`** —
+  deliberately duplicates `SimulationRuntime`'s lock/thread/pause-event/
+  snapshot-publishing scaffolding rather than branching distributed-mode
+  logic into `runtime.py` itself (~20+ tests, exercised transitively by
+  nearly every API/stream test — too high-blast-radius for an opt-in
+  feature). Drives `DistributedCoordinator.step()` instead of
+  `Simulation.step()`; `build_snapshot()`/`RunningMetrics` work against it
+  unmodified via duck typing (same `.world`/`.clock`/`.metrics` shapes).
+- **`POST /simulations` gained `distributed`/`num_workers`/`num_partitions`/
+  `executor` fields** (`"sequential"|"threads"|"processes"` — one enum, not
+  two raw booleans, so the invalid "threads AND processes" combination is
+  unrepresentable at the API boundary). `distributed=true` +
+  `policy=local_avoidance` returns `400` (DistributedCoordinator's existing
+  `NotImplementedError` for `requires_context` policies, caught and
+  translated) — leak-safe, since that rejection happens before any worker
+  pool is created.
+- **Every other route handler needed zero changes** — `/frame`, `/stream`,
+  `/viewport`, `/heatmap`, `/collisions`, pause/resume/step/reset/delete all
+  already called only the method surface both runtime classes implement
+  identically.
+- **`GET /metrics` now includes a per-simulation `"distributed"` key**
+  (absence, not null, distinguishes plain from distributed sims) sourced
+  from `DistributedCoordinator.metrics_summary()` — the method Phase 5 added
+  but never wired up.
+- `reset()` on the new wrapper shuts down the *old* coordinator's worker pool
+  before building a new one (required for `executor="processes"` to never
+  accumulate orphaned pools across resets) — safe under the wrapper's lock
+  because `reset()` already requires `status != RUNNING`, the same guarantee
+  `SimulationRuntime.reset()` relies on.
+- Verified against a real `uvicorn` process AND the real Docker container
+  (`docker compose up --build`, then a manual `distributed=true,
+  executor="processes"` create/step/`/metrics`/delete sequence against the
+  container, confirmed no leaked worker processes afterward).
+- **340 tests now (was 319)** — 21 new: 16 in `tests/test_distributed_runtime.py`
+  (mirrors `tests/test_runtime.py`'s full lifecycle suite, plus
+  process-pool leak-safety cases), 5 in `tests/test_api.py`. Zero changes to
+  `tests/test_runtime.py`, `tests/test_runtime_timing.py`,
+  `tests/test_coordinator.py`, `tests/test_worker.py`, `tests/test_snapshot.py`,
+  or any pre-existing `tests/test_api.py`/`tests/test_stream.py`/
+  `tests/test_monitoring.py` case — confirmed via `git diff` before and after.
 
 ## Context note
 

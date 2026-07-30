@@ -1,0 +1,33 @@
+{
+  "note": "Real measured output from this development machine (16-core/24-thread i9-12900K, Windows). Evaluates WorkerPool's three execution backends: sequential (existing default), threaded (existing, use_threads=True), and process (new, Phase 5, use_processes=True). Commands: python benchmarks/benchmark_phase5.py --mode distributed --workers <N> --executor <sequential|threaded|process> --drones <N> --ticks 10 --warmup 3",
+  "threaded_vs_sequential": {
+    "conclusion": "Threading gives NO real benefit -- roughly matches or is slightly worse than sequential at every worker count tested. Python's GIL is not released long enough by these NumPy calls (many small per-partition arrays, not a few huge ones) to outweigh thread-scheduling/synchronization overhead.",
+    "rows": [
+      {"drones": 20000, "workers": 1, "sequential_ms": 63.837, "threaded_ms": 64.188},
+      {"drones": 20000, "workers": 2, "sequential_ms": 78.818, "threaded_ms": 71.024},
+      {"drones": 20000, "workers": 4, "sequential_ms": 80.117, "threaded_ms": 80.646},
+      {"drones": 20000, "workers": 8, "sequential_ms": 83.316, "threaded_ms": 94.499},
+      {"drones": 50000, "workers": 1, "sequential_ms": 103.958, "threaded_ms": 95.979},
+      {"drones": 50000, "workers": 2, "sequential_ms": 120.063, "threaded_ms": 97.666},
+      {"drones": 50000, "workers": 4, "sequential_ms": 121.075, "threaded_ms": 101.587},
+      {"drones": 50000, "workers": 8, "sequential_ms": 124.100, "threaded_ms": 118.363}
+    ]
+  },
+  "process_vs_sequential": {
+    "conclusion": "A real ProcessPoolExecutor (bypasses the GIL entirely) measured a genuine speedup at 4-8 workers and 20k-100k drones -- 1.2x-1.9x depending on scale/worker count -- but is WORSE than sequential at 1 worker (pure process-pool creation/IPC overhead with no parallel work to gain from). This is why it is implemented as an explicit, off-by-default opt-in (DistributedConfig(use_processes=True)), not a replacement for the sequential default.",
+    "rows": [
+      {"drones": 20000, "workers": 1, "sequential_ms": 63.837, "process_ms": 73.618, "speedup_vs_seq_same_workers": 0.87},
+      {"drones": 20000, "workers": 4, "sequential_ms": 80.117, "process_ms": 65.033, "speedup_vs_seq_same_workers": 1.23},
+      {"drones": 20000, "workers": 8, "sequential_ms": 83.316, "process_ms": 65.317, "speedup_vs_seq_same_workers": 1.28},
+      {"drones": 50000, "workers": 1, "sequential_ms": 103.958, "process_ms": 123.219, "speedup_vs_seq_same_workers": 0.84},
+      {"drones": 50000, "workers": 4, "sequential_ms": 121.075, "process_ms": 87.640, "speedup_vs_seq_same_workers": 1.38},
+      {"drones": 50000, "workers": 8, "sequential_ms": 124.100, "process_ms": 78.344, "speedup_vs_seq_same_workers": 1.58},
+      {"drones": 100000, "workers": 1, "sequential_ms": 162.676, "process_ms": 195.291, "speedup_vs_seq_same_workers": 0.83},
+      {"drones": 100000, "workers": 4, "sequential_ms": 198.221, "process_ms": 126.419, "speedup_vs_seq_same_workers": 1.57},
+      {"drones": 100000, "workers": 8, "sequential_ms": 192.995, "process_ms": 106.004, "speedup_vs_seq_same_workers": 1.82}
+    ],
+    "best_case": "100,000 drones, 8 workers, process executor: 106.004ms/tick vs. sequential's best case (1 worker, 162.676ms/tick) = 1.53x faster than the fastest sequential configuration; 1.82x faster than sequential at the same worker count."
+  },
+  "correctness": "test_process_executor_multi_partition_matches_single_partition and test_run_movement_batch_process_matches_sequential / test_run_detection_batch_process_matches_sequential (tests/test_coordinator.py, tests/test_worker.py) assert byte-identical results between sequential and process execution -- the speedup is free, not a correctness trade-off.",
+  "decision": "Implemented as an opt-in third executor (DistributedConfig.use_processes, WorkerPool(use_processes=True)), off by default. Not made the default because: (1) it regresses at 1 worker / small drone counts, (2) it requires the caller to call coordinator.shutdown() to avoid leaking processes, (3) Windows spawn semantics require the caller's entry point to be __main__-guarded. See README.md's Phase 5 section for full writeup."
+}

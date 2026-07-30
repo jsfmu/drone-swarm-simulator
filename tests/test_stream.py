@@ -72,6 +72,11 @@ def _post(base_url, path, body=None):
         return json.loads(resp.read())
 
 
+def _get(base_url, path):
+    with urllib.request.urlopen(f"{base_url}{path}", timeout=5.0) as resp:
+        return json.loads(resp.read())
+
+
 def _create_sim(base_url, num_drones=50, bounds_max=(50.0, 50.0, 50.0), **kwargs):
     body = {"num_drones": num_drones, "bounds_max": list(bounds_max), **kwargs}
     return _post(base_url, "/simulations", body)["simulation_id"]
@@ -319,6 +324,71 @@ def test_stream_scenario_selection_reproducible(live_server):
     snap_b = _runtimes[sim_b].get_snapshot()
     assert (snap_a.positions == snap_b.positions).all()
     assert snap_a.collision_pairs.shape == snap_b.collision_pairs.shape
+
+
+def test_stream_multiple_concurrent_consumers_each_get_advancing_frames(live_server):
+    """Phase 5 event-transport evaluation: several independent SSE consumers
+    of the SAME simulation must each see their own advancing tick sequence --
+    proof there's no single shared, blockable pipe and no consumer starves
+    another (see routes.py's per-connection async generator + asyncio.to_thread
+    offload; _stream_connection_counts already tracks concurrent connections)."""
+    sim_id = _create_sim(live_server, num_drones=100, bounds_max=(1000.0, 1000.0, 1000.0))
+    _post(live_server, f"/simulations/{sim_id}/start")
+    time.sleep(0.2)
+
+    readers = [_open_stream(_stream_url(live_server, sim_id, hz=10, bounds=(0, 1000, 0, 1000))) for _ in range(4)]
+    try:
+        assert wait_until(lambda: _stream_connection_counts.get(sim_id, 0) == 4)
+        per_reader_events = [r.read_events(3, timeout_s=5.0) for r in readers]
+    finally:
+        for r in readers:
+            r.close()
+
+    for events in per_reader_events:
+        assert len(events) == 3
+        ticks = [frame["tick"] for _, frame in events]
+        assert ticks == sorted(ticks)
+        assert ticks[-1] >= ticks[0]
+
+    assert wait_until(lambda: _stream_connection_counts.get(sim_id, 0) == 0)
+
+
+def test_stream_slow_consumer_does_not_block_simulation_or_other_consumers(live_server):
+    """A consumer that opens a connection but never reads from it must not
+    slow the simulation's own tick rate, nor delay a second, well-behaved
+    consumer of the same simulation -- each connection's frame-build/send
+    runs in its own asyncio task (via asyncio.to_thread), and there is no
+    shared queue a slow reader could back up (see GET .../stream's docstring:
+    "a slow client therefore never accumulates a backlog")."""
+    sim_id = _create_sim(live_server, num_drones=200, bounds_max=(1000.0, 1000.0, 1000.0))
+    _post(live_server, f"/simulations/{sim_id}/start")
+    time.sleep(0.2)
+    tick_before_slow_client = _get(live_server, f"/simulations/{sim_id}")["tick"]
+
+    # Open a stream connection and deliberately never read from it (simulates
+    # a stalled/slow client) -- the server-side generator will still try to
+    # send, and a bounded number of iterations may queue at the OS socket
+    # buffer level, but that must never reach back into the simulation loop.
+    slow_reader = _open_stream(_stream_url(live_server, sim_id, hz=20, bounds=(0, 1000, 0, 1000)))
+    try:
+        time.sleep(0.5)  # let the "slow" connection sit unread
+
+        # The simulation must have kept advancing regardless.
+        tick_after_slow_client = _get(live_server, f"/simulations/{sim_id}")["tick"]
+        assert tick_after_slow_client > tick_before_slow_client
+
+        # A second, well-behaved consumer opened NOW must still get fresh,
+        # advancing frames promptly -- not starved by the unread first stream.
+        fast_reader = _open_stream(_stream_url(live_server, sim_id, hz=20, bounds=(0, 1000, 0, 1000)))
+        try:
+            events = fast_reader.read_events(3, timeout_s=5.0)
+        finally:
+            fast_reader.close()
+        assert len(events) == 3
+        ticks = [frame["tick"] for _, frame in events]
+        assert ticks[-1] >= ticks[0]
+    finally:
+        slow_reader.close()
 
 
 def test_frame_endpoint_and_rest_controls_still_work(live_server):

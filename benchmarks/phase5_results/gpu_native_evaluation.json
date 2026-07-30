@@ -1,0 +1,22 @@
+{
+  "decision": "Neither GPU nor native (Numba/Cython/Rust/C++) acceleration was added in Phase 5. Both were evaluated against the Phase 5 spec's explicit checklist and rejected on evidence, not skipped by default.",
+  "gpu_evaluation": {
+    "hardware_present": "NVIDIA GeForce RTX 4060 Ti is physically installed (confirmed via nvidia-smi and Win32_VideoController).",
+    "software_stack_present": false,
+    "why_rejected": [
+      "torch==2.7.1+cpu is the build present in this environment -- torch.cuda.is_available() returns False, device count 0. No CuPy, no CUDA toolkit installed. Standing up a working CUDA-capable path would mean adding a new heavy dependency AND a toolkit this environment does not have, which the Phase 5 spec's own acceptance conditions require ('setup and CI remain usable without specialized hardware') -- this project's CI/dev environment cannot currently exercise a GPU path at all, so it could not be validated here even if written.",
+      "The dominant hot path (SpatialHashGrid.candidate_pairs()/build(), see optimization_notes.md) is an irregular, variable-length-group gather/scatter/sort workload over tens of thousands of cells -- not a large, regular, dense numerical kernel of the kind GPUs are efficient at. At this project's target scale (up to 100,000 drones, tens of thousands of occupied cells), host<->device transfer overhead for the position/pair arrays involved would plausibly dominate or erase any per-element compute win from a naive port; a GPU-friendly rewrite would need substantial redesign (e.g. a full grid-based parallel sort/bucket scheme), which is a materially larger, higher-risk effort than the measured evidence justifies right now.",
+      "Post-optimization profiling (cProfile, benchmarks/phase5_results, see optimization_notes.md) shows no single remaining hot function consuming a large majority of tick time the way pre-optimization candidate_pairs()/searchsorted() did -- cost is now reasonably distributed across build(), candidate_pairs(), movement, detection, and resolution. There is no longer one dominant, GPU-shaped bottleneck to target."
+    ],
+    "reconsider_if": "A future profiling run on hardware with a working CUDA-enabled NumPy-adjacent stack (CuPy/PyTorch+CUDA) shows one specific stage as a clear, large end-to-end bottleneck at real target scale, AND a pure-NumPy fallback can be kept fully functional for machines without a GPU."
+  },
+  "native_evaluation": {
+    "numba_present": "numba==0.62.1 happens to be installed in this machine's global Python environment (from unrelated work), but is NOT a declared dependency of this project (pyproject.toml only declares numpy as a core dependency).",
+    "why_rejected": [
+      "The one clear per-cell Python-level loop in the hot path (SpatialHashGrid.candidate_pairs()'s 'for ci in multi: ...' within-cell-pairs loop) only executes for cells holding 2+ drones -- rare by design at this project's target density (~1 drone/cell, ~64 cells/drone, see benchmark_simulation.py), since the whole point of the world-scaling convention is to keep collisions/dense cells uncommon. There is no large, hot, pure-Python loop left to JIT that would justify a new compiled-code dependency.",
+      "The Phase 5 dense-lookup optimization (see optimization_notes.md) already delivered a real, measured 1.3x-1.7x speedup on the actual dominant bottleneck using only NumPy -- no new dependency, no build step, no platform-compatibility surface to maintain.",
+      "Adding Numba/Cython/Rust would add a compiled-extension build step (a real cost for a project that currently installs with 'pip install -e .' and a single pure-Python/NumPy dependency), JIT warm-up latency on first call, and a new per-platform compatibility surface -- none of which the current profiling evidence justifies."
+    ],
+    "reconsider_if": "A future profiling run at a much higher target drone count (well beyond the current 100,000-drone bound) or a denser world configuration re-introduces a large, hot, pure-Python per-drone/per-cell loop that vectorization cannot remove."
+  }
+}

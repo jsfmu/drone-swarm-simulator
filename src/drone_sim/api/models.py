@@ -35,6 +35,15 @@ class CreateSimulationRequest(BaseModel):
             "stationary_obstacle", "converging_group", "rare_collision_background",
         ]
     ] = None
+    #: Phase 5 additions -- consulted only when distributed=True; harmless
+    #: (silently ignored) otherwise. See DistributedSimulationRuntime /
+    #: DistributedCoordinator. num_workers capped at 32 as an informative
+    #: bound, not a load-bearing one -- see README.md's Phase 5 "Docker"
+    #: notes on matching it to the deployment's actual CPU limit.
+    distributed: bool = False
+    num_workers: int = Field(1, ge=1, le=32)
+    num_partitions: Optional[int] = Field(None, ge=1)
+    executor: Literal["sequential", "threads", "processes"] = "sequential"
 
 
 class SimulationStatusResponse(BaseModel):
@@ -42,6 +51,8 @@ class SimulationStatusResponse(BaseModel):
     status: str
     tick: int
     num_drones: int
+    execution_mode: Literal["single_process", "distributed"] = "single_process"
+    num_workers: Optional[int] = None
 
 
 class DronePosition(BaseModel):
@@ -96,3 +107,6 @@ class MetricsResponse(BaseModel):
     simulation_id: str
     tick: int
     metrics: dict
+    #: Phase 5: populated only for distributed=True simulations -- see
+    #: DistributedCoordinator.metrics_summary().
+    distributed_metrics: Optional[dict] = None

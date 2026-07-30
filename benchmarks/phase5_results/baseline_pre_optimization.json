@@ -1,0 +1,43 @@
+{
+  "note": "Real measured output from this development machine, captured before any Phase 5 code changes. Commands are exactly as run; see environment.json for hardware/software context. These are a snapshot, not a guarantee -- re-run to reproduce.",
+  "benchmark_simulation_py": {
+    "command": "python benchmarks/benchmark_simulation.py",
+    "rows": [
+      {"drones": 1000, "mean_ms": 1.35, "median_ms": 1.36, "p95_ms": 1.39, "ticks_per_s": 742.53, "candidate_pairs_per_tick": 193, "collisions": 33, "near_misses": 271},
+      {"drones": 10000, "mean_ms": 10.38, "median_ms": 10.35, "p95_ms": 10.75, "ticks_per_s": 96.33, "candidate_pairs_per_tick": 2020, "collisions": 421, "near_misses": 2690},
+      {"drones": 100000, "mean_ms": 137.93, "median_ms": 138.56, "p95_ms": 142.01, "ticks_per_s": 7.25, "candidate_pairs_per_tick": 20729, "collisions": 4023, "near_misses": 28070}
+    ]
+  },
+  "benchmark_avoidance_py": {
+    "command": "python benchmarks/benchmark_avoidance.py",
+    "rows": [
+      {"policy": "goal_directed", "drones": 1000, "mean_ms": 5.34, "ticks_per_s": 187.29},
+      {"policy": "local_avoidance", "drones": 1000, "mean_ms": 10.26, "ticks_per_s": 97.58},
+      {"policy": "goal_directed", "drones": 10000, "mean_ms": 23.84, "ticks_per_s": 41.96},
+      {"policy": "local_avoidance", "drones": 10000, "mean_ms": 42.97, "ticks_per_s": 23.27},
+      {"policy": "goal_directed", "drones": 100000, "mean_ms": 218.39, "ticks_per_s": 4.58},
+      {"policy": "local_avoidance", "drones": 100000, "mean_ms": 391.87, "ticks_per_s": 2.55}
+    ],
+    "stage_timings_ms_at_100000_drones": {
+      "goal_directed": {"pre_grid": 0.0, "pre_pairs": 0.0, "predict": 0.0, "context": 0.0, "movement": 24.486, "boundary": 2.024, "post_grid": 14.294, "post_pairs": 140.329, "detect": 2.250, "resolve": 27.351, "total": 210.988},
+      "local_avoidance": {"pre_grid": 15.036, "pre_pairs": 130.565, "predict": 4.885, "context": 17.384, "movement": 44.980, "boundary": 2.155, "post_grid": 14.709, "post_pairs": 133.286, "detect": 2.181, "resolve": 22.927, "total": 388.380}
+    },
+    "dominant_bottleneck": "candidate_pairs() (pre+post combined) = 263.85ms of 388.38ms total at 100k drones local_avoidance = 67.9% of tick time; post_pairs alone is 140.3ms/210.99ms = 66.5% of goal_directed's tick. Matches README's previously-documented ~69% figure.",
+    "peak_process_working_set_mb": 118.80
+  },
+  "benchmark_distributed_py": {
+    "command": "python benchmarks/benchmark_distributed.py --sizes 1000 5000 --workers 1 4 --ticks 10",
+    "rows": [
+      {"drones": 1000, "config": "single_worker", "workers": 1, "partitions": 1, "ms_per_tick": 1.611, "slowdown": 1.00},
+      {"drones": 1000, "config": "coordinator_1w", "workers": 1, "partitions": 1, "ms_per_tick": 1.896, "slowdown": 1.18},
+      {"drones": 1000, "config": "coordinator_4w", "workers": 4, "partitions": 4, "ms_per_tick": 3.794, "slowdown": 2.36},
+      {"drones": 5000, "config": "single_worker", "workers": 1, "partitions": 1, "ms_per_tick": 7.426, "slowdown": 1.00},
+      {"drones": 5000, "config": "coordinator_1w", "workers": 1, "partitions": 1, "ms_per_tick": 7.224, "slowdown": 0.97},
+      {"drones": 5000, "config": "coordinator_4w", "workers": 4, "partitions": 4, "ms_per_tick": 9.347, "slowdown": 1.26}
+    ],
+    "note": "coordinator_Nw slower than single_worker: N logical workers still run sequentially (use_threads=False default) inside one Python process/GIL -- matches README's documented finding, this is orchestration overhead, not a regression."
+  },
+  "backend_tests": {"command": "python -m pytest -q", "result": "276 passed, 0 failed, 13.14s"},
+  "frontend_tests": {"command": "npm test -- --run", "result": "39 passed, 0 failed, 6 test files"},
+  "frontend_build": {"command": "npm run build", "result": "succeeded, ~157KB JS bundle gzip 50.86KB"}
+}

@@ -1,0 +1,52 @@
+# Phase 5 local, reproducible production-like deployment.
+#
+#   docker compose up --build
+#   Backend:  http://localhost:8000  (health: /health, /ready, /metrics)
+#   Frontend: http://localhost:8080
+#
+# Not a cloud deployment: no Kubernetes, no managed load balancer, no
+# authentication -- see README.md's Phase 5 section for the full list of
+# explicit non-goals this intentionally stops short of.
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    # Bounded runtime defaults -- this project's target is bounded local
+    # simulations (up to 100,000 drones), not an unbounded server; raise
+    # these explicitly if you need more.
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 2g
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "8080:8080"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256m

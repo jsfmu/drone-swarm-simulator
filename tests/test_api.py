@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from drone_sim.api.app import create_app
-from drone_sim.api.routes import MAX_VISIBLE_DRONES, reset_registry
+from drone_sim.api.routes import MAX_VISIBLE_DRONES, _runtimes, reset_registry
 
 
 @pytest.fixture()
@@ -267,3 +267,83 @@ def test_cors_preflight_succeeds_for_the_vite_dev_server_origin(client):
 def test_cors_rejects_an_unrelated_origin(client):
     resp = client.get("/simulations/does-not-exist", headers={"Origin": "http://evil.example.com"})
     assert "access-control-allow-origin" not in {k.lower() for k in resp.headers}
+
+
+# ------------------------------------------------------ Phase 5: distributed mode
+def test_create_simulation_distributed_true_returns_distributed_execution_mode(client):
+    resp = client.post(
+        "/simulations",
+        json={"num_drones": 60, "bounds_max": [50.0, 50.0, 50.0], "distributed": True, "num_workers": 2},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["execution_mode"] == "distributed"
+    assert body["num_workers"] == 2
+
+
+def test_create_simulation_default_is_single_process(client):
+    """Backward compatibility: distributed=False (the default) must reproduce
+    the exact pre-Phase-5 response shape/behavior."""
+    resp = client.post("/simulations", json={"num_drones": 60, "bounds_max": [50.0, 50.0, 50.0]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["execution_mode"] == "single_process"
+    assert body["num_workers"] is None
+
+
+def test_create_simulation_distributed_with_local_avoidance_returns_400(client):
+    before = set(_runtimes)
+    resp = client.post(
+        "/simulations",
+        json={
+            "num_drones": 30, "bounds_max": [50.0, 50.0, 50.0],
+            "distributed": True, "policy": "local_avoidance",
+        },
+    )
+    assert resp.status_code == 400
+    # A rejected creation must never leave a partial/orphaned registry entry.
+    assert set(_runtimes) == before
+
+
+def test_create_simulation_distributed_process_executor_end_to_end(client):
+    resp = client.post(
+        "/simulations",
+        json={
+            "num_drones": 40, "bounds_max": [50.0, 50.0, 50.0],
+            "distributed": True, "num_workers": 2, "executor": "processes",
+        },
+    )
+    assert resp.status_code == 200
+    sim_id = resp.json()["simulation_id"]
+    runtime = _runtimes[sim_id]
+
+    resp = client.post(f"/simulations/{sim_id}/step")
+    assert resp.status_code == 200
+
+    resp = client.get("/metrics")
+    assert resp.status_code == 200
+    assert "distributed" in resp.json()["simulations"][sim_id]
+
+    resp = client.get(f"/simulations/{sim_id}/metrics")
+    assert resp.status_code == 200
+    assert resp.json()["distributed_metrics"] is not None
+
+    resp = client.delete(f"/simulations/{sim_id}")
+    assert resp.status_code == 204
+    # DELETE calls runtime.shutdown() -- the process pool must be released,
+    # not leaked (mirrors tests/test_worker.py's leak-check style).
+    assert runtime._coord.pool._process_executor is None
+
+
+def test_metrics_endpoint_includes_distributed_key_only_for_distributed_sims(client):
+    dist_resp = client.post(
+        "/simulations",
+        json={"num_drones": 20, "bounds_max": [50.0, 50.0, 50.0], "distributed": True, "num_workers": 1},
+    )
+    plain_resp = client.post("/simulations", json={"num_drones": 20, "bounds_max": [50.0, 50.0, 50.0]})
+    dist_id = dist_resp.json()["simulation_id"]
+    plain_id = plain_resp.json()["simulation_id"]
+
+    body = client.get("/metrics").json()
+    assert "distributed" in body["simulations"][dist_id]
+    assert "distributed" not in body["simulations"][plain_id]

@@ -1,0 +1,47 @@
+{
+  "captured_at_utc": "2026-07-28",
+  "python_version": "3.12.6 (tags/v3.12.6:a4a2d2b, Sep 6 2024, 20:11:23) [MSC v.1940 64 bit (AMD64)]",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "processor": "12th Gen Intel(R) Core(TM) i9-12900K",
+  "cpu_cores_physical": 16,
+  "cpu_cores_logical": 24,
+  "total_memory_gb": 31.75,
+  "gpu": ["NVIDIA GeForce RTX 4060 Ti"],
+  "gpu_cuda_available_to_this_project": false,
+  "gpu_notes": "nvidia-smi present and a physical RTX 4060 Ti is installed, but the torch build present in this environment is CPU-only (torch==2.7.1+cpu, torch.cuda.is_available() == False) and no CuPy/CUDA toolkit is installed. GPU acceleration would require adding a CUDA-enabled dependency and toolkit, which is a new environment requirement -- see the Phase 5 GPU-evaluation section in README.md for the measurement-based decision.",
+  "docker_available": false,
+  "docker_notes": "docker CLI not found on PATH; Docker Desktop is not installed on this machine. Deployment artifacts (Dockerfiles, compose file, smoke-test script) were authored and the smoke-test logic was verified against a locally-run (non-containerized) uvicorn process, but the container image was never actually built or run -- this is called out explicitly as an unmet acceptance criterion, not claimed as complete.",
+  "redis_available": false,
+  "redis_notes": "redis-server not installed; a redis Python client happens to be present in the global site-packages from unrelated work but no server was available to test against. Not used.",
+  "node_version": "v22.22.0",
+  "npm_version": "10.9.4",
+  "key_python_dependencies": {
+    "numpy": "1.26.2",
+    "fastapi": "0.104.1",
+    "starlette": "0.27.0",
+    "pydantic": "2.11.7",
+    "uvicorn": "0.24.0.post1",
+    "httpx": "0.25.0",
+    "pytest": "8.3.3",
+    "matplotlib": "3.9.2",
+    "numba": "0.62.1 (present in the global environment; not a declared project dependency prior to Phase 5)"
+  },
+  "declared_project_dependencies_pyproject_toml": {
+    "core": ["numpy>=1.24"],
+    "dev": ["pytest>=7", "httpx>=0.24"],
+    "viz": ["matplotlib>=3.7"],
+    "api": ["fastapi>=0.100", "uvicorn>=0.23"]
+  },
+  "baseline_test_results": {
+    "backend_pytest": "276 passed, 0 failed (python -m pytest -q)",
+    "frontend_vitest": "39 passed, 0 failed (npm test -- --run, 6 test files)",
+    "frontend_build": "vite build succeeded, dist/index.html + assets emitted, ~157KB JS bundle"
+  },
+  "reproduce_with": [
+    "python -m pytest -q",
+    "python benchmarks/benchmark_simulation.py",
+    "python benchmarks/benchmark_avoidance.py",
+    "python benchmarks/benchmark_distributed.py --sizes 1000 5000 --workers 1 4 --ticks 10",
+    "cd frontend && npm test -- --run && npm run build"
+  ]
+}

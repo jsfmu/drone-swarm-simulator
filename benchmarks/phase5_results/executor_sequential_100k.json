@@ -1,0 +1,52 @@
+{
+  "args": {
+    "drones": [
+      100000
+    ],
+    "ticks": 10,
+    "warmup": 3,
+    "policy": "goal_directed",
+    "mode": "distributed",
+    "workers": [
+      1,
+      4,
+      8
+    ],
+    "executor": "sequential",
+    "profile": false,
+    "checkpoint_bench": false,
+    "json_out": "benchmarks/phase5_results/executor_sequential_100k.json",
+    "csv_out": null
+  },
+  "local_results": [],
+  "distributed_results": [
+    {
+      "drones": 100000,
+      "workers": 1,
+      "executor": "sequential",
+      "mean_ms": 162.67577000544406,
+      "ticks_per_s": 6.1471969671115385,
+      "collisions_last_tick": 9780,
+      "peak_rss_mb": 125.362176
+    },
+    {
+      "drones": 100000,
+      "workers": 4,
+      "executor": "sequential",
+      "mean_ms": 198.22135999856982,
+      "ticks_per_s": 5.044864993395339,
+      "collisions_last_tick": 10159,
+      "peak_rss_mb": 125.362176
+    },
+    {
+      "drones": 100000,
+      "workers": 8,
+      "executor": "sequential",
+      "mean_ms": 192.9948900011368,
+      "ticks_per_s": 5.181484338751713,
+      "collisions_last_tick": 10159,
+      "peak_rss_mb": 125.362176
+    }
+  ],
+  "checkpoint_results": []
+}

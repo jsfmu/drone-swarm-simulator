@@ -17,6 +17,15 @@ api = ["fastapi>=0.100", "uvicorn>=0.23"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+# Setuptools only ships .py files by default -- the static browser page
+# (served by create_app()'s StaticFiles mount) must be listed explicitly or
+# a real (non-editable) `pip install` silently drops it. This only surfaced
+# via an actual container build (`pip install ".[api]"`, not `pip install -e`)
+# -- an editable install references the source tree directly, so this bug
+# was invisible in every local dev workflow.
+"drone_sim.api" = ["static/*", "static/**/*"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]

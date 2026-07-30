@@ -1,0 +1,99 @@
+{
+  "args": {
+    "drones": [
+      20000,
+      50000
+    ],
+    "ticks": 10,
+    "warmup": 3,
+    "policy": "goal_directed",
+    "mode": "distributed",
+    "workers": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "executor": "threaded",
+    "profile": false,
+    "checkpoint_bench": false,
+    "json_out": "benchmarks/phase5_results/executor_threaded.json",
+    "csv_out": null
+  },
+  "local_results": [],
+  "distributed_results": [
+    {
+      "drones": 20000,
+      "workers": 1,
+      "executor": "threaded",
+      "mean_ms": 64.1878300026292,
+      "ticks_per_s": 15.579277254878985,
+      "collisions_last_tick": 8921,
+      "peak_rss_mb": 80.03584
+    },
+    {
+      "drones": 20000,
+      "workers": 2,
+      "executor": "threaded",
+      "mean_ms": 71.02390000363812,
+      "ticks_per_s": 14.079767514157574,
+      "collisions_last_tick": 9122,
+      "peak_rss_mb": 97.038336
+    },
+    {
+      "drones": 20000,
+      "workers": 4,
+      "executor": "threaded",
+      "mean_ms": 80.6457499973476,
+      "ticks_per_s": 12.399909481068619,
+      "collisions_last_tick": 9120,
+      "peak_rss_mb": 99.188736
+    },
+    {
+      "drones": 20000,
+      "workers": 8,
+      "executor": "threaded",
+      "mean_ms": 94.49882000044454,
+      "ticks_per_s": 10.582142718769354,
+      "collisions_last_tick": 9467,
+      "peak_rss_mb": 99.188736
+    },
+    {
+      "drones": 50000,
+      "workers": 1,
+      "executor": "threaded",
+      "mean_ms": 95.97941000538412,
+      "ticks_per_s": 10.41890130335145,
+      "collisions_last_tick": 10590,
+      "peak_rss_mb": 120.782848
+    },
+    {
+      "drones": 50000,
+      "workers": 2,
+      "executor": "threaded",
+      "mean_ms": 97.66603999887593,
+      "ticks_per_s": 10.238973547115346,
+      "collisions_last_tick": 9919,
+      "peak_rss_mb": 120.782848
+    },
+    {
+      "drones": 50000,
+      "workers": 4,
+      "executor": "threaded",
+      "mean_ms": 101.58735999430064,
+      "ticks_per_s": 9.843744340399269,
+      "collisions_last_tick": 9918,
+      "peak_rss_mb": 120.782848
+    },
+    {
+      "drones": 50000,
+      "workers": 8,
+      "executor": "threaded",
+      "mean_ms": 118.36317999404855,
+      "ticks_per_s": 8.448573281406272,
+      "collisions_last_tick": 9916,
+      "peak_rss_mb": 120.782848
+    }
+  ],
+  "checkpoint_results": []
+}
