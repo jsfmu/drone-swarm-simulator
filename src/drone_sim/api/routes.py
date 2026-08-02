@@ -15,14 +15,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 
+from .. import checkpoint as _checkpoint
+from ..checkpoint import CheckpointError
 from ..collision_queries import query_collision_markers
 from ..config import SimulationConfig
 from ..coordinator import DistributedConfig
@@ -38,6 +43,12 @@ from ..scenarios import SCENARIOS
 from ..state import World
 from ..viewport import ViewportQuery, find_visible_drones
 from .models import (
+    CheckpointInfo,
+    CheckpointListResponse,
+    CheckpointLoadRequest,
+    CheckpointLoadResponse,
+    CheckpointSaveRequest,
+    CheckpointSaveResponse,
     CollisionMarkerResponse,
     CollisionsResponse,
     CreateSimulationRequest,
@@ -49,6 +60,28 @@ from .models import (
 )
 
 router = APIRouter()
+
+#: Phase 5 checkpoint save/load: on-disk directory checkpoints are written to
+#: and listed from. Overridable via env var so the Docker image (WORKDIR
+#: /app, non-root appuser -- see Dockerfile) can point this at a directory it
+#: actually owns; the bare "checkpoints" default resolves relative to
+#: whatever cwd the process is launched from (repo root in every documented
+#: dev workflow -- see README's "How to run").
+CHECKPOINT_DIR = Path(os.environ.get("DRONE_SIM_CHECKPOINT_DIR", "checkpoints"))
+
+#: Checkpoint names are bare identifiers, never paths (see
+#: CheckpointSaveRequest/CheckpointLoadRequest's charset-restricted Field) --
+#: this second check is defense in depth, not the only guard, so a future
+#: caller that skips Pydantic validation still can't escape CHECKPOINT_DIR.
+_SAFE_CHECKPOINT_NAME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+)
+
+
+def _resolve_checkpoint_path(name: str) -> Path:
+    if not name or not set(name) <= _SAFE_CHECKPOINT_NAME_CHARS:
+        raise HTTPException(status_code=400, detail=f"invalid checkpoint name {name!r}")
+    return CHECKPOINT_DIR / f"{name}.npz"
 
 #: Phase 5: a simulation's runtime is either a single-process SimulationRuntime
 #: (the default) or a DistributedSimulationRuntime (opt-in via
@@ -438,6 +471,90 @@ def get_metrics(simulation_id: str) -> MetricsResponse:
         simulation_id=simulation_id, tick=snapshot.tick, metrics=snapshot.metrics,
         distributed_metrics=distributed_metrics,
     )
+
+
+def _require_single_process(runtime: "SimulationRuntime | DistributedSimulationRuntime") -> SimulationRuntime:
+    """Checkpointing (see ``checkpoint.py``) is only ever defined for a plain
+    ``Simulation`` -- it reads ``sim.engine.get_rng_state()``, which
+    ``DistributedCoordinator`` has no equivalent of (it advances via a
+    ``WorkerPool`` of per-partition workers, not one ``SimulationEngine``).
+    Reject distributed simulations here, before touching the filesystem,
+    exactly like the existing ``distributed=True`` + ``local_avoidance`` 400
+    rejects an unsupported combination before any worker pool is created."""
+    if isinstance(runtime, DistributedSimulationRuntime):
+        raise HTTPException(
+            status_code=400,
+            detail="checkpointing is only supported for single-process (non-distributed) simulations",
+        )
+    return runtime
+
+
+@router.post("/simulations/{simulation_id}/checkpoint", response_model=CheckpointSaveResponse)
+def save_checkpoint(simulation_id: str, req: CheckpointSaveRequest) -> CheckpointSaveResponse:
+    runtime = _require_single_process(_get_runtime(simulation_id))
+    path = _resolve_checkpoint_path(req.name)
+    try:
+        info = runtime.save_checkpoint(path)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return CheckpointSaveResponse(
+        simulation_id=simulation_id,
+        name=req.name,
+        tick=info["tick"],
+        num_drones=info["num_drones"],
+        size_bytes=path.stat().st_size,
+        saved_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+@router.post("/simulations/{simulation_id}/checkpoint/load", response_model=CheckpointLoadResponse)
+def load_checkpoint(simulation_id: str, req: CheckpointLoadRequest) -> CheckpointLoadResponse:
+    runtime = _require_single_process(_get_runtime(simulation_id))
+    path = _resolve_checkpoint_path(req.name)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"checkpoint {req.name!r} not found")
+    try:
+        snapshot = runtime.load_checkpoint(path)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except CheckpointError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    status = runtime.get_status()
+    return CheckpointLoadResponse(
+        simulation_id=simulation_id,
+        name=req.name,
+        tick=snapshot.tick,
+        num_drones=status.num_drones,
+        status=status.status.value,
+    )
+
+
+@router.get("/checkpoints", response_model=CheckpointListResponse)
+def list_checkpoints() -> CheckpointListResponse:
+    """Best-effort directory listing -- not tied to any simulation_id, since
+    a checkpoint file itself carries no simulation_id (see ``checkpoint.py``:
+    only config/tick/rng-state/drone arrays are persisted). Skips any file
+    that fails validation (corrupt, foreign, or mid-write) rather than
+    failing the whole listing -- one bad file must never hide every other
+    valid checkpoint."""
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    items = []
+    for candidate in sorted(CHECKPOINT_DIR.glob("*.npz")):
+        try:
+            meta = _checkpoint.validate_checkpoint(candidate)
+        except CheckpointError:
+            continue
+        stat = candidate.stat()
+        items.append(
+            CheckpointInfo(
+                name=candidate.stem,
+                tick=meta["tick"],
+                num_drones=meta["config"]["num_drones"],
+                size_bytes=stat.st_size,
+                modified_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            )
+        )
+    return CheckpointListResponse(checkpoints=items)
 
 
 def _build_frame_components(

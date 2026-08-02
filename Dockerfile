@@ -34,7 +34,13 @@ WORKDIR /app
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     HOST=0.0.0.0 \
-    PORT=8000
+    PORT=8000 \
+    DRONE_SIM_CHECKPOINT_DIR=/app/checkpoints
+
+# Phase 5 checkpoint save/load (routes.py) writes here at runtime -- WORKDIR
+# was created by root above, so appuser (switched to below) needs explicit
+# ownership or every checkpoint save fails with a PermissionError.
+RUN mkdir -p /app/checkpoints && chown -R appuser:appuser /app
 
 USER appuser
 EXPOSE 8000

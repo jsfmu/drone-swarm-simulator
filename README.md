@@ -13,7 +13,7 @@ The project combines simulation, spatial indexing, collision detection, AI-based
 - Phase 3A: Snapshot, viewport-query API, and minimal browser visualization — complete
 - Phase 3B: SSE streaming endpoint + React/Canvas dashboard (first bounded version) — complete
 - Phase 4: Worker coordinator/pool, spatial partitions, boundary-drone exchange, load-based rebalancing, worker failure recovery — complete for `ScriptedMovementAlgorithm`/`GoalDirectedMovementAlgorithm`/`RandomMovementAlgorithm`; `LocalAvoidanceMovementAlgorithm` (`requires_context=True`) is explicitly out of scope for distributed execution — see [Phase 4: Distributed execution](#phase-4-distributed-execution) below.
-- Phase 5: Profiling-driven hot-path optimization (measured 1.3x-1.7x on the dominant bottleneck), an optional process-backed distributed executor (measured, opt-in), monitoring endpoints, versioned checkpointing, and a local Docker/Compose deployment — complete, including a real `docker compose up --build` + container smoke test (which caught and fixed a genuine packaging bug — see below); GPU and Numba/Cython/Rust acceleration were evaluated and explicitly rejected on evidence, and Redis was evaluated and rejected (the existing bounded/latest-state SSE design already satisfies the measured requirement) — see [Phase 5: Optimization and deployment](#phase-5-optimization-and-deployment) below.
+- Phase 5: Profiling-driven hot-path optimization (measured 1.3x-1.7x on the dominant bottleneck), an optional process-backed distributed executor (measured, opt-in), monitoring endpoints, versioned checkpointing, and a local Docker/Compose deployment — complete, including a real `docker compose up --build` + container smoke test (which caught and fixed a genuine packaging bug — see below); GPU and Numba/Cython/Rust acceleration were evaluated and explicitly rejected on evidence, and Redis was evaluated and rejected (the existing bounded/latest-state SSE design already satisfies the measured requirement) — see [Phase 5: Optimization and deployment](#phase-5-optimization-and-deployment) below. A follow-up session made distributed execution reachable via the API (`POST /simulations`'s `distributed`/`num_workers`/`num_partitions`/`executor` fields), and a second follow-up put every Phase 5/distributed capability — execution-mode selection, distributed/performance/service-health metrics, and checkpoint save/load — into the React dashboard itself (previously curl-only in the checkpoint case), plus a new, minimal `POST .../checkpoint`(`/load`)/`GET /checkpoints` HTTP surface for checkpointing — see "React dashboard: distributed execution, metrics, and checkpoint UI" under Phase 5 below.
 
 Phase 1 (local simulation kernel) and Phase 2 (AI and scenario control — batched movement policies, trajectory prediction, local collision avoidance, controlled rare-collision scenarios, collision-rate validation) are implemented, tested, and unchanged by Phase 3A/3B/4. Phase 3A (snapshot layer, background simulation runtime, vectorized viewport/heatmap/collision-marker queries, a small FastAPI app, and a minimal static browser page) remains as documented below. Phase 3B adds a `GET /simulations/{id}/stream` Server-Sent-Events endpoint and a small React + Canvas dashboard on top of Phase 3A's existing query logic — see [Phase 3B: real-time streaming and dashboard](#phase-3b-real-time-streaming-and-dashboard) below. Phase 4 adds `drone_sim.partition`/`drone_sim.worker`/`drone_sim.coordinator` — a spatially-partitioned, multi-logical-worker alternative to `Simulation`, still entirely local/in-process (no real network, Redis, or Kubernetes) — see [Phase 4: Distributed execution](#phase-4-distributed-execution) below. Online reinforcement learning, `NeuralAvoidanceMovementAlgorithm` (evaluated and removed — see below), a real multi-machine cluster/RPC layer, Redis, databases, authentication, cloud deployment, GPU simulation, and WebGL rendering remain out of scope.
 
@@ -43,7 +43,7 @@ pip install -e .
 python -m pytest -q
 ```
 
-This picks up `src/` and `tests/` automatically via `pyproject.toml`'s `pythonpath`/`testpaths` settings — no manual `PYTHONPATH` needed. 218 tests as of the browser/Matplotlib viewer investigation (205 from Phase 1/2/3A and the tick-rate regression fix — see below — plus 13 more from this investigation: the `DELETE /simulations/{id}` endpoint stopping and removing a runtime, `/frame` no longer double-serializing its payload or making a second unmeasured lock acquisition, `SpatialHashGrid.occupancy_stats()`, and the `TickProfile` occupancy/pair-count fields). Of the 205: 142 from Phase 1/2; 50 from the initial Phase 3A build covering the snapshot layer, viewport/heatmap/collision-marker queries, the background runtime, and the FastAPI endpoints; 13 more from the tick-rate regression fix covering `RunningMetrics`, tick-timing isolation, lock fairness, and `/frame` snapshot reuse. **241 tests as of Phase 3B** (was 218 above, plus the API-client and remote-viewer additions documented in `CLAUDE.md`'s session notes, plus 14 new in `tests/test_stream.py` for the SSE streaming endpoint and 3 new CORS regression tests in `test_api.py` — see [Phase 3B: real-time streaming and dashboard](#phase-3b-real-time-streaming-and-dashboard) below). **276 tests as of Phase 4** (was 241 above, plus 35 new across `tests/test_partition.py`, `tests/test_worker.py`, and `tests/test_coordinator.py` — see [Phase 4: Distributed execution](#phase-4-distributed-execution) below). The frontend has its own separate Vitest suite (39 tests as of Phase 3B) under `frontend/`, run with `npm test`, not part of `python -m pytest`.
+This picks up `src/` and `tests/` automatically via `pyproject.toml`'s `pythonpath`/`testpaths` settings — no manual `PYTHONPATH` needed. 218 tests as of the browser/Matplotlib viewer investigation (205 from Phase 1/2/3A and the tick-rate regression fix — see below — plus 13 more from this investigation: the `DELETE /simulations/{id}` endpoint stopping and removing a runtime, `/frame` no longer double-serializing its payload or making a second unmeasured lock acquisition, `SpatialHashGrid.occupancy_stats()`, and the `TickProfile` occupancy/pair-count fields). Of the 205: 142 from Phase 1/2; 50 from the initial Phase 3A build covering the snapshot layer, viewport/heatmap/collision-marker queries, the background runtime, and the FastAPI endpoints; 13 more from the tick-rate regression fix covering `RunningMetrics`, tick-timing isolation, lock fairness, and `/frame` snapshot reuse. **241 tests as of Phase 3B** (was 218 above, plus the API-client and remote-viewer additions documented in `CLAUDE.md`'s session notes, plus 14 new in `tests/test_stream.py` for the SSE streaming endpoint and 3 new CORS regression tests in `test_api.py` — see [Phase 3B: real-time streaming and dashboard](#phase-3b-real-time-streaming-and-dashboard) below). **276 tests as of Phase 4** (was 241 above, plus 35 new across `tests/test_partition.py`, `tests/test_worker.py`, and `tests/test_coordinator.py` — see [Phase 4: Distributed execution](#phase-4-distributed-execution) below). **350 tests as of the dashboard follow-up session** (319 after Phase 5, 340 after Phase 5's own "distributed mode via the API" follow-up, plus 10 new in `tests/test_api_checkpoint.py` — see "React dashboard: distributed execution, metrics, and checkpoint UI" under Phase 5 below). The frontend has its own separate Vitest suite (**104 tests** as of that same follow-up, was 39 as of Phase 3B) under `frontend/`, run with `npm test`, not part of `python -m pytest`.
 
 **3. Run the benchmarks**
 
@@ -112,6 +112,72 @@ cd frontend && npm test              # Vitest: pure-logic unit tests
 python benchmarks/benchmark_streaming.py   # Phase 3B streaming cost: 1k/10k/100k
 python benchmarks/benchmark_distributed.py # Phase 4: single-worker vs. coordinator (1w/Nw) overhead + agreement
 ```
+
+**7. Run the production dashboard (Docker)**
+
+```bash
+docker compose up --build
+```
+
+Then open **http://localhost:8080/** — this is the same React dashboard as
+step 6, built for production (`vite build`, served by nginx) and pointed at
+the containerized backend on `http://localhost:8000` (baked in at build time
+via `VITE_API_BASE_URL` — see "Deployment" under Phase 5 below). Backend
+health/readiness: `http://localhost:8000/health`, `http://localhost:8000/ready`.
+
+**Interpreting the dashboard's major metrics** (see "React dashboard:
+distributed execution, metrics, and checkpoint UI" under Phase 5 below for
+the full design):
+
+- **Execution mode badge** (top bar, next to the simulation id) — "LOCAL" or
+  "DISTRIBUTED · N WORKERS", read from `SimulationStatusResponse`. Set once
+  by the Execution mode controls at creation time; never changes for that
+  simulation's lifetime (there is no "convert an existing simulation"
+  capability, local or distributed).
+- **Simulation & performance** — per-tick figures from the existing SSE
+  stream (tick, status, active drones, mean tick time, ticks/second,
+  candidate pairs, this-tick vs. cumulative collisions/near-misses,
+  snapshot/heatmap/collision/serialization/frame-generation timings in ms).
+- **Throughput sparkline** — recent ticks/second, from the same stream, no
+  extra requests.
+- **Distributed execution** — worker/partition counts, health, reassignment
+  counts, and a per-partition owned/ghost/candidate-pair/tick-time table;
+  reads "Not a distributed simulation" for a local one rather than an empty
+  table.
+- **Checkpoint management** — save/load by name, a list of what's on disk
+  (tick + drone count per entry), last save/load feedback. Disabled with an
+  explanation for distributed simulations (checkpointing needs a single
+  `Simulation`'s RNG state, which a `DistributedCoordinator` doesn't have)
+  and for Load specifically while the simulation is running (pause first).
+- **Service health** — backend health/readiness, process uptime/memory, API
+  request count/latency, and streaming consumer/frame counters, polled every
+  3 seconds independent of the simulation's own tick rate.
+
+**Demo walkthrough (~60 seconds):**
+
+1. Set `num_drones` to `100000`, leave Execution mode on "Local", click
+   *Create / New simulation*, then *Start*. Watch the heatmap fill in and the
+   Simulation & performance / Throughput cards start updating live.
+2. Switch Execution mode to "Distributed", set workers to `4` and executor
+   to `processes`, click *Create / New simulation* again, then *Start*. The
+   badge now reads "DISTRIBUTED · 4 WORKERS"; the Distributed execution card
+   populates with a live per-partition load table within a few seconds.
+3. Type a name (e.g. `demo`) into Checkpoint management and click *Save
+   checkpoint* — a green confirmation shows the saved tick and file size.
+4. Click *Pause*, then *Step* a handful of times to advance the tick further.
+5. Click *Load checkpoint* — the displayed tick visibly drops back to the
+   saved value, status reads "paused", and a second green confirmation
+   appears. (Checkpoint save/load only works on a local, not distributed,
+   simulation — switch back to "Local" and create a fresh simulation first if
+   you're continuing from step 2.)
+
+Every number in this walkthrough and in "React dashboard: distributed
+execution, metrics, and checkpoint UI" below (test counts, tick numbers,
+worker counts) came from an actual `pytest`/`npm test`/`npm run build` run
+or a live, Playwright-driven session against a real `uvicorn` + `vite dev`
+pair during this work — none are estimates, consistent with this project's
+"measurements before infrastructure" principle (see "Engineering
+principles" below).
 
 ## Goals
 
@@ -2251,10 +2317,12 @@ pass, production build still succeeds — Phase 5 made no frontend changes.
 
 ### Known limitations
 
-- Distributed-execution metrics (`DistributedCoordinator.metrics_summary()`)
-  are not reachable via any live HTTP endpoint, since the API layer never
-  runs a coordinator (see "Monitoring" above) — this is an existing
-  architectural fact this phase did not change, not a Phase 5 regression.
+- ~~Distributed-execution metrics (`DistributedCoordinator.metrics_summary()`)
+  are not reachable via any live HTTP endpoint~~ — **resolved** by "Distributed
+  mode via the API" above (`GET /metrics`'s per-simulation `"distributed"` key,
+  `MetricsResponse.distributed_metrics`); kept struck through rather than
+  deleted since this bullet was never corrected when that follow-up session
+  shipped, and a stale "known limitation" is worse than a visibly-corrected one.
 - `/metrics` does not include a true per-tick candidate-pair count or
   occupied-cell count (only the existing cumulative/mean figures) — adding
   either would require passing a `TickProfile` into every tick of the live
@@ -2269,10 +2337,180 @@ pass, production build still succeeds — Phase 5 made no frontend changes.
   install (see "Deployment" above) — this bullet is kept only as a record
   that it was, at one point, an open item, and to record the real packaging
   bug (`pyproject.toml` package-data) that verifying it for real caught.
-- Checkpointing operates on a plain `Simulation` only; there is no
-  `SimulationRuntime`/`DistributedCoordinator`-level checkpoint/resume API
-  yet (a caller wanting that today re-wraps the `Simulation`
-  `load_checkpoint()` returns into a fresh runtime/coordinator itself).
+- ~~Checkpointing operates on a plain `Simulation` only; there is no
+  `SimulationRuntime`-level checkpoint/resume API yet~~ — **resolved** by
+  "React dashboard: distributed execution, metrics, and checkpoint UI" below
+  (`SimulationRuntime.save_checkpoint()`/`load_checkpoint()` plus
+  `POST /simulations/{id}/checkpoint`(`/load`)). Still accurate as originally
+  written for `DistributedCoordinator`, though: checkpointing remains
+  rejected with `400` for `distributed=true` simulations (see that section
+  for why — a `DistributedCoordinator` has no single `SimulationEngine`/RNG
+  state the checkpoint format was designed to capture).
+
+### React dashboard: distributed execution, metrics, and checkpoint UI (follow-up session)
+
+A session made every already-implemented Phase 5/distributed capability
+reachable from the browser dashboard, not just curl — the goal being a
+recruiter-facing demo, not new backend behavior. Full contract discovery
+happened first (see this section's own git history/PR description); the
+summary here is what changed.
+
+**One real backend gap found and closed, minimally.** Checkpoint save/load
+(`drone_sim.checkpoint`, "Checkpointing and deterministic resume" above)
+had zero HTTP surface — Python functions only, not curl-able, contradicting
+the assumption that it was merely "accessible mainly through curl." Closed
+with the smallest addition that mirrors this file's own existing patterns
+exactly, nothing kernel-level touched:
+
+- `SimulationRuntime` gained `save_checkpoint(path)`/`load_checkpoint(path)`
+  (`runtime.py`) — thin, lock-protected wrappers around
+  `checkpoint.save_checkpoint()`/`load_checkpoint()`. `save_checkpoint` never
+  requires pausing (it only needs the same lock every other read already
+  takes); `load_checkpoint` requires `status != RUNNING` (same guard as
+  `reset()`/`step_once()`) since it replaces `self._sim`/`self._config`
+  outright, then leaves status `PAUSED` with fresh `RunningMetrics`/
+  `TickTimings` — the same "recreate, don't mutate in place" contract
+  `reset()` already has, just sourced from a checkpoint instead of
+  `World.create(config)`.
+- **Deliberately not extended to `DistributedCoordinator`.** Checkpointing
+  reads `sim.engine.get_rng_state()` — `DistributedCoordinator` has
+  `.config`/`.clock`/`.world`/`.metrics` (the same duck-typed shape
+  `build_snapshot()` already relies on) but no single `SimulationEngine`/RNG
+  state, since it advances via a `WorkerPool` of per-partition workers, not
+  one engine. `POST .../checkpoint`(`/load`) reject `distributed=true`
+  simulations with `400`, checked before touching the filesystem — the same
+  "reject before any worker pool exists" pattern `distributed=true` +
+  `local_avoidance` already uses.
+- New routes in `routes.py`: `POST /simulations/{id}/checkpoint` (save),
+  `POST /simulations/{id}/checkpoint/load` (load), `GET /checkpoints`
+  (best-effort directory listing — skips any file that fails
+  `validate_checkpoint()` rather than failing the whole list). New models in
+  `models.py`: `CheckpointSaveRequest`/`Response`,
+  `CheckpointLoadRequest`/`Response`, `CheckpointInfo`/`ListResponse`.
+  Checkpoint `name` is a bare identifier validated by a Pydantic
+  `Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")` **and** re-checked server-side
+  before path construction — no `/`, `\`, or `.` means path traversal is
+  structurally impossible, not merely rejected by convention. Files land in
+  `CHECKPOINT_DIR` (env var `DRONE_SIM_CHECKPOINT_DIR`, default `./checkpoints`
+  relative to launch cwd) as `<name>.npz`.
+- `Dockerfile` gained `RUN mkdir -p /app/checkpoints && chown -R appuser:appuser /app`
+  plus `DRONE_SIM_CHECKPOINT_DIR=/app/checkpoints` — without this, the first
+  checkpoint save in the container would fail with a `PermissionError`
+  (`WORKDIR /app` is created by root before the image drops to a non-root
+  `appuser`). Caught by re-reading the Dockerfile before writing this, not by
+  a failed container run — worth a real `docker compose up --build` pass to
+  confirm before relying on it for a demo (not done as part of this
+  session — see Known limitations below).
+- `.gitignore` gained `checkpoints/` — these are runtime artifacts, not
+  source, same treatment as `frontend/dist/`.
+- New `tests/test_api_checkpoint.py` (10 tests): save, save-then-list
+  metadata, empty list, load restores tick and pauses, unknown-simulation
+  404, unknown-checkpoint 404, invalid-name 422 (Pydantic pattern rejects
+  before the handler runs), distributed-simulation 400 for both save and
+  load, load-while-running 409, save-while-running allowed (200) — the one
+  asymmetry between save and load, deliberately verified explicitly.
+
+**Frontend: no new dependency, same architecture as Phase 3B.** Still Vite +
+React + hand-rolled `<canvas>`/`<svg>`, still zero component-render tests
+(this project's frontend suite has always been pure-function/reducer unit
+tests only — see "Tests" under Phase 3B above — extended, not abandoned):
+
+```text
+frontend/src/
+  api.js                          + getMetrics/getGlobalMetrics/getHealth/getReady,
+                                     saveCheckpoint/loadCheckpoint/listCheckpoints;
+                                     request() now extracts FastAPI's {detail}
+                                     instead of dumping raw response bodies
+  hooks/useServiceMetrics.js       polls global /metrics + /health + /ready + the
+                                     active simulation's distributed_metrics every
+                                     3s (bounded, independent of the 8Hz SSE stream);
+                                     never overlaps a slow/hung request
+  utils/executionMode.js          local/distributed form -> CreateSimulationRequest
+                                     fields (pure); execution-mode badge text (pure)
+  utils/checkpointReducer.js      save/load state machine (same pattern as
+                                     streamReducer.js)
+  utils/groupedMetrics.js         distributed_metrics / global /metrics+/health+/ready
+                                     -> labeled rows, tolerant of any missing piece
+  utils/sparkline.js              bounded value history -> SVG path (pure, no
+                                     charting library -- this project has never had one)
+  components/
+    ExecutionModeControls.jsx     local/distributed radio + workers/partitions/executor
+                                     (applied on next create, same contract as
+                                     PolicyControls -- never mutates a running sim)
+    ExecutionModeBadge.jsx        "LOCAL" / "DISTRIBUTED · N WORKERS", next to sim id
+    DistributedPanel.jsx          worker/partition health + per-partition load table,
+                                     or an explicit "not distributed" placeholder
+    ServiceHealthPanel.jsx        backend health/readiness/process/API/streaming
+    ThroughputSparkline.jsx       recent ticks/second, fed by the existing SSE stream
+                                     (no extra network traffic for this)
+    CheckpointControls.jsx        save/load, available-checkpoints list, disabled
+                                     while in flight, disabled+explained when the
+                                     active simulation is distributed or running
+```
+
+`SimulationDashboard.jsx` was reorganized (top status bar with the execution
+badge; a Configuration section grouping `SimulationControls`/
+`PolicyControls`/`ExecutionModeControls`; main content unchanged in size
+— heatmap + `MetricsPanel`/`CollisionSummary`, both untouched, plus the new
+sparkline alongside them; a secondary column for the three new panels) —
+this is layout/composition only. `MetricsPanel`/`CollisionSummary`/
+`ConnectionStatus`/`HeatmapCanvas`/`SimulationViewport` and their existing
+tests are byte-for-byte unchanged. `SimulationControls`'s Create button
+gained an `isCreating` guard (disables itself + relabels while the request
+is in flight) — the one behavior change to a pre-existing component,
+addressing "prevent duplicate submissions" generally, not just for the new
+features.
+
+**Why polling, not more SSE.** The existing `GET .../stream` frame's
+`metrics` key is `RunningMetrics.summary()` only (tick timings, collision
+counts) — never `distributed_metrics` or the process/API/streaming globals
+`GET /metrics` exposes (see "Monitoring" above); extending the stream
+payload to carry those would mean recomputing them at stream-rate (up to
+20Hz) for data that changes far slower. `useServiceMetrics` polls the three
+extra endpoints separately at a fixed, bounded 3s interval instead — an
+order of magnitude slower than the stream, deliberately never competing
+with simulation throughput, and skips a poll entirely rather than queuing
+one if the previous request hasn't resolved yet.
+
+**Testing.** Backend: **350 tests** (was 340) — 10 new in
+`tests/test_api_checkpoint.py`, described above; every pre-existing test
+file unchanged. Frontend: **104 Vitest tests** (was 39) — 65 new across
+`executionMode.test.js`, `checkpointReducer.test.js`, `groupedMetrics.test.js`,
+`sparkline.test.js`, `api.test.js` (new — first test file to mock `fetch`,
+via `vi.stubGlobal`, no new dependency), plus additions to the existing
+`requestBuilder.test.js`; production build (`npm run build`) still succeeds.
+Verified against a real `uvicorn` + `vite dev` pair with Playwright
+(headless Chromium, not part of the committed test suite): created a
+5,000-drone local simulation and confirmed the heatmap/collision
+markers/metrics panel all still populate; switched to distributed
+(4 workers, `processes` executor), confirmed the badge read "DISTRIBUTED ·
+4 WORKERS" and the distributed panel populated with real per-partition
+load within one 3s poll; saved a checkpoint, stepped the simulation forward,
+loaded the checkpoint back, and confirmed the displayed tick visibly
+dropped to the saved value with status "paused" and both save/load feedback
+messages shown; confirmed the service-health panel showed backend health
+"ok" and readiness "ready". Zero browser console/page errors across the run.
+
+### Known limitations (dashboard follow-up)
+
+- The Docker image change (`DRONE_SIM_CHECKPOINT_DIR` + the `chown` fix for
+  `appuser`'s write access) was reasoned through by re-reading the
+  Dockerfile, not verified with a real `docker compose up --build` — unlike
+  Phase 5's own deployment work, which explicitly was verified that way (see
+  "Deployment" above). Run the real container build before depending on
+  checkpoint save/load in the dockerized dashboard.
+- No checkpoint deletion endpoint — `GET /checkpoints` lists and
+  `POST .../checkpoint/load` reads, but removing an old one today means
+  deleting the file from `CHECKPOINT_DIR` directly. Out of scope for this
+  session (not asked for; adding it is a small, separate follow-up).
+- `DistributedConfig`'s `rebalance_interval_ticks`/`rebalance_imbalance_threshold`/
+  `worker_retry_limit`/`halo_distance` are still not exposed as
+  `CreateSimulationRequest` fields (unchanged from Phase 5/its follow-up) —
+  the dashboard's execution-mode controls only expose what
+  `CreateSimulationRequest` already accepts (`num_workers`/`num_partitions`/
+  `executor`), by design; the read-only `DistributedPanel` does display
+  `total_reassignments`/`reassignments_this_tick`/`last_tick_attempts` from
+  `metrics_summary()`, since those ARE already live.
 
 ## Local debug viewer (prototype)
 

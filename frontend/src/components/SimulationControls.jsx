@@ -23,6 +23,7 @@ export default function SimulationControls({
   onDelete,
   isPaused,
   hasSimulation,
+  isCreating,
 }) {
   return (
     <div className="simulation-controls">
@@ -39,7 +40,9 @@ export default function SimulationControls({
         ))}
       </div>
       <div className="simulation-controls__buttons">
-        <button onClick={onCreate}>Create / New simulation</button>
+        <button onClick={onCreate} disabled={isCreating}>
+          {isCreating ? "Creating…" : "Create / New simulation"}
+        </button>
         <button onClick={onStart} disabled={!hasSimulation}>
           Start
         </button>

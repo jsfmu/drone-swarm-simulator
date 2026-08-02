@@ -66,7 +66,7 @@ uvicorn drone_sim.api.app:app --reload                             # Phase 3A AP
 python scripts/run_visualizer.py --remote                          # same viewer, polling that server instead
 python benchmarks/benchmark_phase5.py                               # Phase 5: optimization/scaling/parallel-execution benchmark
 python scripts/smoke_test.py --base-url http://127.0.0.1:8000       # Phase 5 deployment smoke test (add --base-url to skip Docker)
-docker compose up --build                                           # Phase 5 local deployment (not verified in this repo's dev environment -- see README)
+docker compose up --build                                           # Phase 5 local deployment; verified for real via WSL2+Docker Desktop -- see README's Phase 5 "Deployment" subsection
 ```
 
 `pyproject.toml` sets `pythonpath = ["src"]` and `testpaths = ["tests"]`, so the
@@ -593,6 +593,111 @@ session doesn't relitigate it:
   `tests/test_coordinator.py`, `tests/test_worker.py`, `tests/test_snapshot.py`,
   or any pre-existing `tests/test_api.py`/`tests/test_stream.py`/
   `tests/test_monitoring.py` case — confirmed via `git diff` before and after.
+
+## React dashboard: distributed execution, metrics, and checkpoint UI (follow-up session)
+
+A session made every already-implemented Phase 5/distributed capability
+reachable from the React dashboard itself, not just curl — a frontend
+integration task, explicitly not a kernel/architecture change. Full
+writeup: README.md's "React dashboard: distributed execution, metrics, and
+checkpoint UI" subsection (under Phase 5). Summary so a fresh session
+doesn't relitigate it:
+
+- **One real backend gap found during discovery, closed minimally:**
+  checkpoint save/load had **no HTTP route at all** — Python-only
+  (`checkpoint.py`), contradicting the assumption it was merely
+  curl-accessible. Added the smallest necessary surface: `SimulationRuntime`
+  gained `save_checkpoint(path)`/`load_checkpoint(path)` (`runtime.py`,
+  lock-protected, same "requires `status != RUNNING`" guard `reset()`
+  already has for load; save has no such guard since it never mutates
+  `self._sim`); three new routes in `routes.py`
+  (`POST .../checkpoint`, `POST .../checkpoint/load`, `GET /checkpoints`)
+  and matching models in `models.py`. **Deliberately not extended to
+  `DistributedCoordinator`** — checkpointing needs `sim.engine.get_rng_state()`,
+  which a coordinator has no equivalent of (it advances via a `WorkerPool`,
+  not one `SimulationEngine`); both new routes reject `distributed=true`
+  simulations with `400`, same pattern as the existing `distributed=true` +
+  `local_avoidance` rejection.
+- Checkpoint `name` is a bare identifier (`^[A-Za-z0-9_-]{1,64}$`, enforced
+  by both a Pydantic `Field(pattern=...)` and a server-side re-check) —
+  no `/`, `\`, or `.` means path traversal into `CHECKPOINT_DIR` (env var
+  `DRONE_SIM_CHECKPOINT_DIR`, default `./checkpoints`) is structurally
+  impossible, not just rejected by convention.
+- `Dockerfile` gained `RUN mkdir -p /app/checkpoints && chown -R
+  appuser:appuser /app` plus `DRONE_SIM_CHECKPOINT_DIR=/app/checkpoints` --
+  `WORKDIR /app` is created by root before the image drops to non-root
+  `appuser`, so without this the first checkpoint save in the container
+  would fail with `PermissionError`. **Not verified with a real `docker
+  compose up --build`** in this session (see Known limitations below) --
+  reasoned from re-reading the Dockerfile, unlike Phase 5's own deployment
+  work which was verified that way.
+- New `tests/test_api_checkpoint.py` (10 tests) covers save, save-then-list,
+  empty list, load restores tick + pauses, unknown simulation/checkpoint
+  404s, invalid name 422, distributed-simulation 400 (both save and load),
+  load-while-running 409, and save-while-running allowed (200) -- the one
+  asymmetry between the two, verified explicitly.
+- **Frontend, no new dependency:** `api.js` gained
+  `getMetrics`/`getGlobalMetrics`/`getHealth`/`getReady`/`saveCheckpoint`/
+  `loadCheckpoint`/`listCheckpoints`, plus a `request()` rewrite that
+  extracts FastAPI's `{"detail": ...}` (string or Pydantic validation array)
+  instead of surfacing raw response bodies. New `hooks/useServiceMetrics.js`
+  polls global `/metrics` + `/health` + `/ready` + the active simulation's
+  `distributed_metrics` every 3s -- deliberately separate from the existing
+  8Hz SSE stream, whose `metrics` field has never included any of this (only
+  `RunningMetrics.summary()`). New pure `utils/`: `executionMode.js`,
+  `checkpointReducer.js` (same state-machine pattern as `streamReducer.js`),
+  `groupedMetrics.js`, `sparkline.js` (hand-rolled SVG history, no charting
+  library -- this project has never had one). New components:
+  `ExecutionModeControls`/`ExecutionModeBadge`/`DistributedPanel`/
+  `ServiceHealthPanel`/`ThroughputSparkline`/`CheckpointControls`.
+  `SimulationDashboard.jsx` reorganized (top status bar with the execution
+  badge; configuration section grouping the existing + new controls; main
+  content unchanged in size -- heatmap + the existing, untouched
+  `MetricsPanel`/`CollisionSummary` plus the new sparkline; a secondary
+  column for the three new panels) -- layout/composition only.
+  `MetricsPanel`/`CollisionSummary`/`ConnectionStatus`/`HeatmapCanvas`/
+  `SimulationViewport` and their tests are byte-for-byte unchanged.
+  `SimulationControls`' Create button gained an `isCreating` guard
+  (disable + relabel while in flight) -- the one behavior change to a
+  pre-existing component.
+- Frontend tests stay 100% pure-function/reducer unit tests (no component
+  rendering, no new testing library) -- consistent with this project's
+  frontend suite since Phase 3B. `api.test.js` is the first file to mock
+  `fetch` (via Vitest's built-in `vi.stubGlobal`, no new dependency).
+- **350 backend tests now (was 340)** -- 10 new, all in
+  `tests/test_api_checkpoint.py`; every pre-existing backend test file
+  unchanged. **104 frontend tests now (was 39)** -- 65 new across five new
+  test files plus additions to the existing `requestBuilder.test.js`;
+  production build (`npm run build`) still succeeds.
+- **Verified live**, not just by test suite: a real `uvicorn` +
+  `vite dev` pair, driven with Playwright (headless Chromium, ad hoc for
+  this verification -- not part of the committed suite): created a
+  5,000-drone local simulation (heatmap/collisions/metrics all populated as
+  before) -> switched to distributed (4 workers, `processes` executor,
+  badge read "DISTRIBUTED · 4 WORKERS", distributed panel populated with
+  real per-partition load) -> saved a checkpoint on a fresh local simulation,
+  stepped it forward, loaded the checkpoint back (displayed tick visibly
+  dropped to the saved value, status "paused", both save/load feedback
+  messages shown) -> confirmed service health showed "ok"/"ready". Zero
+  browser console/page errors. Test-only checkpoint files and the ad hoc dev
+  servers were cleaned up afterward -- `checkpoints/` is now gitignored.
+
+**Known limitations, this follow-up:**
+- The Dockerfile checkpoint-directory permission fix was reasoned through,
+  not verified with a real container build -- run `docker compose up
+  --build` before relying on checkpoint save/load in the dockerized
+  dashboard.
+- No checkpoint deletion endpoint (`GET /checkpoints` lists, load reads;
+  removing one today means deleting the file directly) -- not asked for,
+  out of scope for this session.
+- `DistributedConfig`'s `rebalance_interval_ticks`/
+  `rebalance_imbalance_threshold`/`worker_retry_limit`/`halo_distance`
+  remain unexposed by `CreateSimulationRequest` (unchanged from Phase 5) --
+  the dashboard's execution-mode controls only surface what the API already
+  accepts (`num_workers`/`num_partitions`/`executor`); the read-only
+  distributed panel does show `total_reassignments`/
+  `reassignments_this_tick`/`last_tick_attempts` from `metrics_summary()`,
+  since those are already live.
 
 ## Context note
 

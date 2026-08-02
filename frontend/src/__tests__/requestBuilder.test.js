@@ -37,6 +37,37 @@ describe("buildCreateSimulationRequest", () => {
     const body = buildCreateSimulationRequest({ ...baseForm, xMin: 10, xMax: 10 });
     expect(body.bounds_max[0]).toBeGreaterThanOrEqual(1);
   });
+
+  it("sends distributed:false and no other execution fields in local mode", () => {
+    const body = buildCreateSimulationRequest({ ...baseForm, executionMode: "local" });
+    expect(body.distributed).toBe(false);
+    expect(body).not.toHaveProperty("num_workers");
+    expect(body).not.toHaveProperty("num_partitions");
+    expect(body).not.toHaveProperty("executor");
+  });
+
+  it("sends distributed:true plus num_workers/executor in distributed mode", () => {
+    const body = buildCreateSimulationRequest({
+      ...baseForm,
+      executionMode: "distributed",
+      numWorkers: 4,
+      executor: "processes",
+    });
+    expect(body.distributed).toBe(true);
+    expect(body.num_workers).toBe(4);
+    expect(body.executor).toBe("processes");
+    expect(body).not.toHaveProperty("num_partitions");
+  });
+
+  it("includes num_partitions only when explicitly set in distributed mode", () => {
+    const body = buildCreateSimulationRequest({
+      ...baseForm,
+      executionMode: "distributed",
+      numWorkers: 2,
+      numPartitions: 8,
+    });
+    expect(body.num_partitions).toBe(8);
+  });
 });
 
 describe("buildStreamQuery", () => {

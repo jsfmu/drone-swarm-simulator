@@ -27,3 +27,6 @@ Thumbs.db
 # Frontend (frontend/)
 frontend/node_modules/
 frontend/dist/
+
+# Phase 5 checkpoints (local runtime artifacts, not source)
+checkpoints/

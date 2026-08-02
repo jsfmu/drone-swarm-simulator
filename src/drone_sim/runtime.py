@@ -31,16 +31,20 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Deque, Dict
+from pathlib import Path
+from typing import Callable, Deque, Dict, Union
 
 import numpy as np
 
+from . import checkpoint as _checkpoint
 from .collisions import DetectionResult
 from .config import SimulationConfig
 from .movement import MovementSystem
 from .simulation import Simulation
 from .snapshot import SimulationSnapshot, build_snapshot
 from .state import World
+
+PathLike = Union[str, Path]
 
 #: How many of the most recent tick times to keep for median/p95 display.
 #: Bounded so RunningMetrics.summary() stays O(1) regardless of how long the
@@ -311,6 +315,50 @@ class SimulationRuntime:
         """Timing for the most recently completed tick (see ``TickTimings``)."""
         with self._lock:
             return self._last_timings
+
+    # ------------------------------------------------------------ checkpoint
+    def save_checkpoint(self, path: PathLike) -> Dict[str, int]:
+        """Write a Phase 5 checkpoint (see ``checkpoint.save_checkpoint``) of
+        the simulation's current state.
+
+        Lock-protected like every other read here: waits for an in-progress
+        tick to finish rather than racing it, so the written checkpoint always
+        reflects one fully-completed tick, never a half-mutated one. Safe to
+        call while the background loop is running -- unlike ``load_checkpoint``,
+        this never mutates ``self._sim``.
+        """
+        with self._lock:
+            _checkpoint.save_checkpoint(self._sim, path)
+            return {"tick": self._sim.clock.tick, "num_drones": self._sim.world.state.num_drones}
+
+    def load_checkpoint(self, path: PathLike) -> SimulationSnapshot:
+        """Replace the current simulation with one restored from ``path``.
+
+        Requires the runtime not be actively running (same guard as
+        ``reset()``/``step_once()``) -- replacing ``self._sim`` out from under
+        a live background tick would be a real race, not merely a semantic
+        surprise. On success the restored simulation becomes ``self._sim``
+        (its ``config`` -- which may describe a different drone count than
+        the simulation originally had -- replaces ``self._config`` too, so a
+        later ``reset()`` reproduces the *loaded* state, not the pre-load
+        one), status moves to ``PAUSED`` (loaded and ready, not "never
+        started"), and per-session running metrics/timings are cleared --
+        exactly ``reset()``'s contract, only sourcing the world/clock/RNG
+        from the checkpoint instead of a fresh ``World.create(config)``.
+        """
+        with self._lock:
+            if self._status == RuntimeStatus.RUNNING:
+                raise RuntimeError(
+                    f"simulation {self.simulation_id!r} is running -- pause it before loading a checkpoint"
+                )
+            loaded = _checkpoint.load_checkpoint(path, movement=self._movement)
+            self._sim = loaded
+            self._config = loaded.config
+            self._status = RuntimeStatus.PAUSED
+            self._running_metrics = RunningMetrics()
+            self._last_timings = TickTimings()
+            self._snapshot = build_snapshot(self.simulation_id, self._sim, None, {})
+            return self._snapshot
 
     # ------------------------------------------------------------- internal
     def _advance_one_locked(self) -> None:

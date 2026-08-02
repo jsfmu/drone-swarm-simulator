@@ -110,3 +110,46 @@ class MetricsResponse(BaseModel):
     #: Phase 5: populated only for distributed=True simulations -- see
     #: DistributedCoordinator.metrics_summary().
     distributed_metrics: Optional[dict] = None
+
+
+class CheckpointSaveRequest(BaseModel):
+    """``name`` is a bare identifier, never a path -- the server always
+    resolves it to ``<checkpoint dir>/<name>.npz`` (see routes.py's
+    ``_resolve_checkpoint_path``), so this charset is restrictive by design
+    (no ``/``, ``\\``, or ``.``) to make path traversal structurally
+    impossible rather than merely checked-for."""
+
+    name: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class CheckpointSaveResponse(BaseModel):
+    simulation_id: str
+    name: str
+    tick: int
+    num_drones: int
+    size_bytes: int
+    saved_at: str
+
+
+class CheckpointLoadRequest(BaseModel):
+    name: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class CheckpointLoadResponse(BaseModel):
+    simulation_id: str
+    name: str
+    tick: int
+    num_drones: int
+    status: str
+
+
+class CheckpointInfo(BaseModel):
+    name: str
+    tick: int
+    num_drones: int
+    size_bytes: int
+    modified_at: str
+
+
+class CheckpointListResponse(BaseModel):
+    checkpoints: List[CheckpointInfo]

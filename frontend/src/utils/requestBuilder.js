@@ -1,6 +1,9 @@
+import { buildExecutionModeFields } from "./executionMode.js";
+
 // Builds the POST /simulations request body from the SimulationControls +
-// PolicyControls form state. Kept pure so "does picking a policy/scenario
-// actually configure the request" is testable without rendering anything.
+// PolicyControls + ExecutionModeControls form state. Kept pure so "does
+// picking a policy/scenario/execution mode actually configure the request"
+// is testable without rendering anything.
 export function buildCreateSimulationRequest(form) {
   const xMin = Number(form.xMin ?? 0);
   const yMin = Number(form.yMin ?? 0);
@@ -26,6 +29,10 @@ export function buildCreateSimulationRequest(form) {
   // Phase 3A default (RandomMovementAlgorithm, DroneState.generate()).
   if (form.policy) body.policy = form.policy;
   if (form.scenario) body.scenario = form.scenario;
+  // Phase 5 execution-mode fields (distributed/num_workers/num_partitions/
+  // executor) -- see executionMode.js. Always includes `distributed`
+  // explicitly (true or false); the rest only when distributed is selected.
+  Object.assign(body, buildExecutionModeFields(form));
   return body;
 }
 
