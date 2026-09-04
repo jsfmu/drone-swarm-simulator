@@ -47,15 +47,14 @@ def create_app() -> FastAPI:
     )
     # Phase 3A's static/index.html is served BY this app (same-origin, no CORS
     # needed). Phase 3B's React dashboard runs on its own Vite dev server
-    # (default http://localhost:5173) -- a genuinely different origin -- so
-    # REST calls and the EventSource stream both need CORS allowed here, or
-    # the browser blocks them before any handler runs (surfaces in the
-    # frontend as a generic "TypeError: Failed to fetch"). Scoped to
-    # localhost/127.0.0.1 on any port rather than "*", since this is a local
-    # dev tool with no auth and no cookies -- not a public deployment.
+    # (default http://localhost:5173) for local dev, or on Render for production
+    # -- a genuinely different origin -- so REST calls and the EventSource
+    # stream both need CORS allowed here, or the browser blocks them before any
+    # handler runs (surfaces in the frontend as a generic "TypeError: Failed to
+    # fetch").
     app.add_middleware(
         CORSMiddleware,
-        allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
+        allow_origin_regex=r"(http://(localhost|127\.0\.0\.1)(:\d+)?|https://drone-swarm-simulator-8sj3\.onrender\.com)",
         allow_methods=["*"],
         allow_headers=["*"],
     )
